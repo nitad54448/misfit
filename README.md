@@ -4,7 +4,7 @@ This document provides a technical reference for the "Misfit Le Bail Fit" web ap
 
 ## How to Start
 
-To start the program, you can go [here](https://[your-github-username].github.io/[repository-name]/misfit.html). (Please replace the placeholder with the actual URL).
+To start this program, you can go [here](https://nitad54448.github.io/misfit/misfit.html).
 
 ## Table of Contents
 
