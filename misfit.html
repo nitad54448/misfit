@@ -1357,7 +1357,7 @@ const parsePhilipsUdfFile = (text) => {
                  // Pass total intensity to LM for correct weighting
                  results = await refineParametersLM(params, fitFlags, constraints, maxIterations, progressCallback, workingData_net, workingData_total.intensity);
             } else {
-                 // SA is less sensitive to weighting, so this part remains the same
+                 // SA is less sensitive to weighting
                  results = await refineParametersSA(params, fitFlags, constraints, maxIterations, progressCallback);
             }
             
@@ -1509,9 +1509,7 @@ const parsePhilipsUdfFile = (text) => {
             let params = JSON.parse(JSON.stringify(initialParams));
             let lambda = 0.001;
 
-            // --- CHANGE IS HERE: Use the total intensity for stable weights ---
             const weights = total_intensity_for_weights.map(y => 1 / Math.max(y, 1));
-            // --- END CHANGE ---
             
             const maxTth = Math.max(...workingData.tth);
             
@@ -1731,7 +1729,6 @@ const parsePhilipsUdfFile = (text) => {
     const reader = new FileReader();
     reader.onload = (evt) => {
         try {
-            // Use the new, more robust detection function
             const parsedData = detectAndParseFile(file.name, evt.target.result);
             
             if (!parsedData || !parsedData.tth || parsedData.tth.length === 0) {
@@ -1743,7 +1740,6 @@ const parsePhilipsUdfFile = (text) => {
                 controls.wavelength.value = parsedData.wavelength.toFixed(5);
             }
             
-            // --- The rest of this is standard setup for misfit.html ---
             fullExperimentalData = { tth: parsedData.tth, intensity: parsedData.intensity };
             lastRawDifference = []; 
             calculatedBackground = new Array(fullExperimentalData.tth.length).fill(0);
