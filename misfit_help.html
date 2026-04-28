@@ -1,0 +1,346 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Misfit — Help</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Source+Serif+4:opsz,wght@8..60,400;8..60,600;8..60,700&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
+<style>
+:root {
+    --dark-bg: #111827;
+    --medium-bg: #1f2937;
+    --light-bg: #374151;
+    --border: #4b5563;
+    --accent: #3b82f6;
+    --accent-soft: #60a5fa;
+    --text: #e5e7eb;
+    --text-dim: #9ca3af;
+    --text-mid: #d1d5db;
+    --rule: rgba(75, 85, 99, 0.5);
+}
+
+* { box-sizing: border-box; }
+
+html, body { margin: 0; padding: 0; background: var(--dark-bg); }
+
+body {
+    font-family: 'Source Serif 4', 'Iowan Old Style', Georgia, serif;
+    color: var(--text-mid);
+    font-size: 17px;
+    line-height: 1.65;
+    min-height: 100vh;
+    /* subtle grid pattern, like a lab notebook */
+    background-image:
+        linear-gradient(var(--medium-bg) 1px, transparent 1px),
+        linear-gradient(90deg, var(--medium-bg) 1px, transparent 1px);
+    background-size: 32px 32px;
+    background-position: -1px -1px;
+}
+
+main {
+    max-width: 760px;
+    margin: 0 auto;
+    padding: 4rem 2rem 6rem;
+    background: var(--dark-bg);
+    border-left: 1px solid var(--rule);
+    border-right: 1px solid var(--rule);
+    min-height: 100vh;
+}
+
+.eyebrow {
+    font-family: 'JetBrains Mono', ui-monospace, monospace;
+    font-size: 0.72rem;
+    letter-spacing: 0.18em;
+    text-transform: uppercase;
+    color: var(--accent-soft);
+    margin: 0 0 0.5rem;
+}
+
+h1 {
+    font-family: 'Source Serif 4', serif;
+    font-weight: 700;
+    font-size: 2.4rem;
+    line-height: 1.15;
+    color: var(--text);
+    margin: 0 0 0.4rem;
+    letter-spacing: -0.01em;
+}
+
+.subtitle {
+    font-style: italic;
+    color: var(--text-dim);
+    font-size: 1.05rem;
+    margin: 0 0 2.5rem;
+    padding-bottom: 1.5rem;
+    border-bottom: 1px solid var(--rule);
+}
+
+h2 {
+    font-family: 'Source Serif 4', serif;
+    font-weight: 600;
+    font-size: 1.35rem;
+    color: var(--text);
+    margin: 3rem 0 0.75rem;
+    letter-spacing: -0.005em;
+    position: relative;
+    padding-left: 1.4rem;
+}
+
+h2::before {
+    content: counter(section, decimal-leading-zero);
+    counter-increment: section;
+    position: absolute;
+    left: 0;
+    top: 0.35em;
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 0.7rem;
+    color: var(--accent);
+    font-weight: 500;
+}
+
+main { counter-reset: section; }
+
+h3 {
+    font-family: 'Source Serif 4', serif;
+    font-weight: 600;
+    font-size: 1.05rem;
+    color: var(--text);
+    margin: 1.6rem 0 0.4rem;
+}
+
+p { margin: 0 0 0.9rem; }
+
+a { color: var(--accent-soft); text-decoration: none; border-bottom: 1px dotted var(--accent-soft); }
+a:hover { color: var(--accent); border-bottom-style: solid; }
+
+code, .mono {
+    font-family: 'JetBrains Mono', ui-monospace, monospace;
+    font-size: 0.88em;
+    color: var(--text);
+    background: var(--medium-bg);
+    padding: 0.08em 0.4em;
+    border-radius: 3px;
+    border: 1px solid var(--rule);
+}
+
+.eq {
+    display: block;
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 0.92rem;
+    color: var(--text);
+    background: var(--medium-bg);
+    border-left: 2px solid var(--accent);
+    padding: 0.85rem 1rem;
+    margin: 1rem 0;
+    border-radius: 0 4px 4px 0;
+    overflow-x: auto;
+    white-space: nowrap;
+}
+
+dl {
+    display: grid;
+    grid-template-columns: max-content 1fr;
+    gap: 0.55rem 1.25rem;
+    margin: 1rem 0 1.5rem;
+    padding: 1rem 1.25rem;
+    border: 1px solid var(--rule);
+    border-radius: 4px;
+    background: rgba(31, 41, 55, 0.35);
+}
+
+dt {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 0.85rem;
+    color: var(--accent-soft);
+    font-weight: 500;
+    padding-top: 0.1em;
+}
+
+dd {
+    margin: 0;
+    color: var(--text-mid);
+    font-size: 0.97rem;
+}
+
+ul {
+    padding-left: 1.2rem;
+    margin: 0.5rem 0 1rem;
+}
+
+li { margin-bottom: 0.4rem; }
+li::marker { color: var(--accent); }
+
+.note {
+    margin: 1.5rem 0;
+    padding: 0.9rem 1.1rem;
+    background: rgba(59, 130, 246, 0.07);
+    border-left: 2px solid var(--accent);
+    color: var(--text-mid);
+    font-size: 0.95rem;
+    border-radius: 0 3px 3px 0;
+}
+
+.note strong {
+    color: var(--text);
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 0.78rem;
+    text-transform: uppercase;
+    letter-spacing: 0.1em;
+    display: block;
+    margin-bottom: 0.25rem;
+}
+
+footer {
+    margin-top: 4rem;
+    padding-top: 1.25rem;
+    border-top: 1px solid var(--rule);
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 0.75rem;
+    color: var(--text-dim);
+    letter-spacing: 0.05em;
+    display: flex;
+    justify-content: space-between;
+    flex-wrap: wrap;
+    gap: 0.5rem;
+}
+
+@media (max-width: 640px) {
+    main { padding: 2.5rem 1.25rem 4rem; }
+    h1 { font-size: 1.8rem; }
+    dl { grid-template-columns: 1fr; gap: 0.15rem 0; }
+    dt { padding-top: 0.6rem; }
+    .eq { white-space: pre-wrap; word-break: break-word; }
+}
+</style>
+</head>
+<body>
+<main>
+
+<p class="eyebrow">Misfit · Reference</p>
+<h1>Le Bail Two-Phase Refinement</h1>
+<p class="subtitle">A short guide to the controls, the math, and the diagnostics.</p>
+
+<h2>What it does</h2>
+<p>
+    Misfit performs a Le Bail extraction on a powder diffraction pattern with <em>two</em> phases
+    refined simultaneously. Lattice parameters can optionally be constrained to be equal between
+    the two phases — useful for misfit layered compounds and composites where one or more cell
+    edges are shared. The peak shape is GSAS Profile 4 (pseudo-Voigt with the standard Cagliotti /
+    Lorentzian-broadening parameterisation). The background is estimated by a rolling-ball
+    morphological filter and held fixed during the main refinement.
+</p>
+
+<h2>Workflow</h2>
+<ul>
+    <li>Load a 2θ–intensity pattern with the file picker (top of the controls panel). Many lab
+        formats are auto-detected: <code>.xy</code>, <code>.csv</code>, <code>.txt</code>,
+        <code>.xrdml</code>, <code>.brml</code>, <code>.ras</code>, <code>.gsa</code>, <code>.uxd</code>.</li>
+    <li>Pick the Bravais system and centering for each phase, then enter starting cell parameters.
+        Tick the boxes next to a parameter to mark it for refinement.</li>
+    <li>Use the <strong>Constraints</strong> section to tie equivalent parameters between phases
+        (e.g. shared <em>a</em> and <em>c</em> for an in-plane–coherent intergrowth).</li>
+    <li>Adjust the rolling-ball radius and pre-smoothing on the <strong>Background</strong> tab
+        until the orange line tracks the baseline cleanly between peaks.</li>
+    <li>Open the <strong>Profile</strong> tab to set GSAS Profile 4 coefficients and instrumental
+        corrections. Refinement flags are independent per parameter.</li>
+    <li>Click <strong>Run Refinement</strong>. Choose Levenberg–Marquardt for fast local
+        convergence with ESDs, or Simulated Annealing if the starting point is poor.</li>
+</ul>
+
+<h2>Lattice parameters</h2>
+<p>
+    Inputs are in ångströms (cell edges) and degrees (cell angles). Only parameters that exist
+    for the chosen Bravais system are shown — choosing <code>Cubic (F)</code>, for example, hides
+    everything except <em>a</em>. The reflection-allowed conditions for P, I, F, C, and R lattices
+    are applied automatically when generating the (hkl) list.
+</p>
+
+<h2>GSAS Profile 4 coefficients</h2>
+<p>
+    The peak full-width-at-half-maximum is split into a Gaussian and a Lorentzian contribution,
+    with the standard Caglioti and Thompson–Cox–Hastings forms:
+</p>
+
+<span class="eq">σ²&nbsp;=&nbsp;GU·tan²θ&nbsp;+&nbsp;GV·tanθ&nbsp;+&nbsp;GW&nbsp;+&nbsp;GP/cos²θ&nbsp;&nbsp;&nbsp;&nbsp;[centidegrees²]</span>
+<span class="eq">HWHMₗ&nbsp;=&nbsp;LX/cosθ&nbsp;+&nbsp;LY·tanθ&nbsp;&nbsp;&nbsp;&nbsp;[centidegrees]</span>
+
+<dl>
+    <dt>GU</dt><dd>Microstrain-like Gaussian broadening (∝ tan²θ).</dd>
+    <dt>GV</dt><dd>Cross term in the Caglioti expression. Often slightly negative.</dd>
+    <dt>GW</dt><dd>Constant Gaussian instrument width (the irreducible floor).</dd>
+    <dt>GP</dt><dd>Gaussian crystallite-size term (∝ 1/cos²θ). Rarely refined for X-rays.</dd>
+    <dt>LX</dt><dd>Lorentzian crystallite-size broadening (∝ 1/cosθ).</dd>
+    <dt>LY</dt><dd>Lorentzian microstrain broadening (∝ tanθ).</dd>
+    <dt>η</dt><dd>Pseudo-Voigt mixing fraction. η = 0 → pure Gaussian, η = 1 → pure Lorentzian.</dd>
+</dl>
+
+<p>
+    Both component profiles are <em>area</em>-normalised, so integrated intensities returned by
+    the Le Bail extraction do not depend on the peak width.
+</p>
+
+<h2>Sample displacement &amp; transparency</h2>
+<p>
+    Two systematic 2θ shifts are available. Both coefficients are stored in centidegree units, so
+    the contributions are (in degrees):
+</p>
+
+<span class="eq">Δ(2θ)<sub>shft</sub>&nbsp;=&nbsp;−2·shft·cosθ&nbsp;/&nbsp;100</span>
+<span class="eq">Δ(2θ)<sub>trns</sub>&nbsp;=&nbsp;trns·sin(2θ)&nbsp;/&nbsp;100</span>
+
+<dl>
+    <dt>shft</dt><dd>Vertical sample displacement (Bragg–Brentano geometry only).</dd>
+    <dt>trns</dt><dd>Sample transparency / X-ray penetration depth (flat-plate reflection only).</dd>
+    <dt>zero</dt><dd>Constant 2θ zero offset, applied to all peaks of both phases.</dd>
+</dl>
+
+<div class="note">
+    <strong>Caveat</strong>
+    Do not refine <code>zero</code>, <code>shft</code>, and lattice parameters together — they are
+    strongly correlated and the refinement will pick up false minima. A pragmatic order is:
+    refine cell parameters first with <code>zero</code> fixed at 0, then release <code>shft</code>
+    or <code>trns</code> as appropriate for your geometry, then re-refine the cell.
+</div>
+
+<h2>Diagnostics</h2>
+<dl>
+    <dt>R<sub>p</sub></dt><dd>Profile residual: 100 · Σ|y<sub>obs</sub>−y<sub>calc</sub>| / Σ|y<sub>obs</sub>|.</dd>
+    <dt>R<sub>wp</sub></dt><dd>Weighted profile residual, with Poisson weights w<sub>i</sub> = 1/max(y<sub>i</sub>, 1). The quantity actually minimised by LM.</dd>
+    <dt>χ²ᵣ</dt><dd>Reduced chi-squared, Σw·(y<sub>obs</sub>−y<sub>calc</sub>)² / (N−P). The goodness-of-fit GoF&nbsp;=&nbsp;√χ²ᵣ is shown alongside in the report.</dd>
+</dl>
+
+<p>
+    The difference curve (red, below the pattern) is the most informative diagnostic. Sinusoidal
+    residuals around peaks indicate an unfit cell parameter or zero offset; asymmetric residuals
+    indicate a profile-shape problem (try refining LX, LY, or η).
+</p>
+
+<h2>Plot interaction</h2>
+<ul>
+    <li>Mouse wheel inside the plot: zoom on both axes.</li>
+    <li>Mouse wheel <em>over the x-axis</em>: zoom 2θ only. Same for the y-axis.</li>
+    <li>Click and drag: pan.</li>
+    <li>Right-click anywhere on the plot: reset zoom.</li>
+    <li>The 2θ-min / 2θ-max sliders below the controls trim the fitting range; everything outside
+        is shown but excluded from the refinement.</li>
+</ul>
+
+<h2>Output</h2>
+<p>
+    <strong>Save Data</strong> writes a tab-separated text file containing the experimental
+    intensity, the calculated total pattern, the refined background, and the difference, on the
+    full 2θ grid. <strong>Generate PDF</strong> produces a multi-page report including refined
+    parameters with their estimated standard deviations (from the LM covariance matrix), the full
+    list of reflections sorted by 2θ, and the data table.
+</p>
+
+<footer>
+    <span>MISFIT · Le Bail two-phase refinement</span>
+    <span>NitaD · Univ. Paris-Saclay</span>
+</footer>
+
+</main>
+</body>
+</html>

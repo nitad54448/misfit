@@ -456,7 +456,7 @@
             </div>
 
             <div style="position: absolute; bottom: 0.5rem; right: 1rem; font-size: 0.75rem; color: #9ca3af;">
-                NitaD, Univ Paris-Saclay, 28 april 2026
+                NitaD, Univ Paris-Saclay, 19 Sept 2025
             </div>
         </div>
     </div>
@@ -510,6 +510,9 @@
         let lastGeneratedHklList = []; 
         let lastRawDifference = [];
         let calculatedBackground = [];
+        // Cursor position in chart data coordinates, updated on every mousemove over the canvas.
+        // Used by the tooltip filter to gate display on cursor y (only show below the zero baseline).
+        const chartCursor = { dataX: null, dataY: null };
         
         // --- Core Logic ---
         function getSystemAndCentering(phaseIndex) {
@@ -1679,14 +1682,20 @@ const parsePhilipsUdfFile = (text) => {
         }
 
         // Build HKL marker bar data, skipping any peaks whose corrected 2θ falls outside the
-        // active visible/fit range. The corrected position uses the full GSAS shift:
+        // active visible/fit range. Each marker carries its hkl indices and calculated 2θ so
+        // the tooltip can display them. The corrected position uses the *full* GSAS shift:
         // zero offset + sample displacement (shft) + transparency (trns).
         function buildHklMarkers(hklList, params, top_y, barHeight, tthMin, tthMax) {
             const out = [];
             for (const peak of hklList) {
                 const x = peak.tth + params.zeroShift + calculatePeakShift(peak.tth, params);
                 if (x < tthMin || x > tthMax) continue;
-                out.push({ x, y: [top_y - barHeight, top_y] });
+                out.push({
+                    x,
+                    y: [top_y - barHeight, top_y],
+                    hkl: peak.hkl_list,
+                    tthCalc: x
+                });
             }
             return out;
         }
@@ -1801,7 +1810,33 @@ const parsePhilipsUdfFile = (text) => {
                 }, plugins: {
                     zoom: { pan: { enabled: true, mode: 'xy', threshold: 5 }, zoom: { wheel: { enabled: false }, pinch: { enabled: true }, drag: { enabled: false }}},
                     legend: { labels: { filter: item => !['Difference Zero', 'Simulation (Manual)'].includes(item.text) }},
-                    tooltip: { enabled: false }
+                    tooltip: {
+                        enabled: true, mode: 'index', intersect: false, position: 'nearest',
+                        // Only HKL marker items are shown — curve values are already visible
+                        // on the plot itself, and clutter the tooltip otherwise. We also gate
+                        // the tooltip to only appear when the cursor's data-y is below the
+                        // zero baseline (i.e., over the markers / difference strip), so the
+                        // pattern itself stays unobstructed.
+                        filter: (item) => {
+                            const y = chartCursor.dataY;
+                            if (y === null || y > 0) return false;
+                            return item.dataset.label === 'HKL P1' || item.dataset.label === 'HKL P2';
+                        },
+                        callbacks: {
+                            // Header line: the calculated 2θ of the marker(s) being tooltipped.
+                            title: (items) => {
+                                if (!items.length) return '';
+                                const x = items[0].raw?.tthCalc ?? items[0].parsed?.x;
+                                return (typeof x === 'number') ? `2θ_calc = ${x.toFixed(3)}°` : '';
+                            },
+                            label: (ctx) => {
+                                const lbl = ctx.dataset.label || '';
+                                const hkls = ctx.raw?.hkl;
+                                const hklStr = Array.isArray(hkls) && hkls.length ? hkls.join(' ') : '';
+                                return `${lbl}: ${hklStr}`;
+                            },
+                        }
+                    }
                 } }
             });
         }
@@ -2211,6 +2246,25 @@ const parsePhilipsUdfFile = (text) => {
             else if (x >= left && x <= right && y >= top && y <= bottom) chart.zoom({ x: zoomFactor, y: zoomFactor }, { x, y });
         });
         controls.mainChartCanvas.addEventListener('contextmenu', e => { e.preventDefault(); if (mainChart) mainChart.resetZoom(); });
+
+        // Track cursor position in data coordinates so the tooltip filter can decide whether
+        // we're in the markers/difference band (y < 0) or in the data band (y >= 0).
+        controls.mainChartCanvas.addEventListener('mousemove', (e) => {
+            if (!mainChart || !mainChart.chartArea) return;
+            const rect = controls.mainChartCanvas.getBoundingClientRect();
+            const px = e.clientX - rect.left;
+            const py = e.clientY - rect.top;
+            const { left, right, top, bottom } = mainChart.chartArea;
+            if (px < left || px > right || py < top || py > bottom) {
+                chartCursor.dataX = null; chartCursor.dataY = null;
+                return;
+            }
+            chartCursor.dataX = mainChart.scales.x.getValueForPixel(px);
+            chartCursor.dataY = mainChart.scales.y.getValueForPixel(py);
+        });
+        controls.mainChartCanvas.addEventListener('mouseleave', () => {
+            chartCursor.dataX = null; chartCursor.dataY = null;
+        });
 
         // Help button: open the standalone help page in a new tab/window.
         document.getElementById('help-button').addEventListener('click', () => {
