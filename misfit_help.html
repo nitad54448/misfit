@@ -224,29 +224,34 @@ footer {
 
 <h2>What it does</h2>
 <p>
-    Misfit performs a Le Bail extraction on a powder diffraction pattern with <em>two</em> phases
-    refined simultaneously. Lattice parameters can optionally be constrained to be equal between
-    the two phases — useful for misfit layered compounds and composites where one or more cell
-    edges are shared. The peak shape is GSAS Profile 4 (pseudo-Voigt with the standard Cagliotti /
-    Lorentzian-broadening parameterisation). The background is estimated by a rolling-ball
-    morphological filter and held fixed during the main refinement.
+    Misfit performs an iterative Le Bail extraction on a powder diffraction pattern with <em>two</em>
+    phases refined simultaneously. Lattice parameters can optionally be constrained to be equal
+    between the two phases — useful for misfit layered compounds and composites where one or more
+    cell edges are shared. Peak widths follow the GSAS Profile 4 (Caglioti) parameterisation; the
+    peak shape itself is a pseudo-Voigt, by default in the Thompson–Cox–Hastings form. The
+    background is estimated by a rolling-ball morphological filter and held fixed during the main
+    refinement.
 </p>
 
 <h2>Workflow</h2>
 <ul>
     <li>Load a 2θ–intensity pattern with the file picker (top of the controls panel). Many lab
         formats are auto-detected: <code>.xy</code>, <code>.csv</code>, <code>.txt</code>,
-        <code>.xrdml</code>, <code>.brml</code>, <code>.ras</code>, <code>.gsa</code>, <code>.uxd</code>.</li>
+        <code>.xrdml</code>, <code>.brml</code>, <code>.ras</code>, <code>.gsa</code>,
+        <code>.udf</code>, <code>.esd</code>, <code>.std</code>.</li>
     <li>Pick the Bravais system and centering for each phase, then enter starting cell parameters.
         Tick the boxes next to a parameter to mark it for refinement.</li>
     <li>Use the <strong>Constraints</strong> section to tie equivalent parameters between phases
         (e.g. shared <em>a</em> and <em>c</em> for an in-plane–coherent intergrowth).</li>
     <li>Adjust the rolling-ball radius and pre-smoothing on the <strong>Background</strong> tab
         until the orange line tracks the baseline cleanly between peaks.</li>
-    <li>Open the <strong>Profile</strong> tab to set GSAS Profile 4 coefficients and instrumental
-        corrections. Refinement flags are independent per parameter.</li>
+    <li>Open the <strong>Profile</strong> tab to choose the profile function, set the GSAS Profile 4
+        coefficients, and set instrumental corrections. Refinement flags are independent per
+        parameter.</li>
     <li>Click <strong>Run Refinement</strong>. Choose Levenberg–Marquardt for fast local
-        convergence with ESDs, or Simulated Annealing if the starting point is poor.</li>
+        convergence with ESDs, or Simulated Annealing (the default) if the starting point is poor.
+        Both methods minimise the same weighted objective, so switching between them does not
+        change what is being fitted.</li>
 </ul>
 
 <h2>Lattice parameters</h2>
@@ -254,17 +259,24 @@ footer {
     Inputs are in ångströms (cell edges) and degrees (cell angles). Only parameters that exist
     for the chosen Bravais system are shown — choosing <code>Cubic (F)</code>, for example, hides
     everything except <em>a</em>. The reflection-allowed conditions for P, I, F, C, and R lattices
-    are applied automatically when generating the (hkl) list.
+    are applied automatically when generating the (hkl) list. For monoclinic and rhombohedral
+    cells the <em>l</em> index is scanned over negative values as well, since (hkl) and (hk-l) are
+    not equivalent when the cross term is present.
 </p>
 
-<h2>GSAS Profile 4 coefficients</h2>
+<h2>Peak widths — GSAS Profile 4 coefficients</h2>
 <p>
-    The peak full-width-at-half-maximum is split into a Gaussian and a Lorentzian contribution,
-    with the standard Caglioti and Thompson–Cox–Hastings forms:
+    The peak width is split into a Gaussian and a Lorentzian contribution, each with the standard
+    Caglioti-type angular dependence:
 </p>
 
 <span class="eq">σ²&nbsp;=&nbsp;GU·tan²θ&nbsp;+&nbsp;GV·tanθ&nbsp;+&nbsp;GW&nbsp;+&nbsp;GP/cos²θ&nbsp;&nbsp;&nbsp;&nbsp;[centidegrees²]</span>
 <span class="eq">HWHMₗ&nbsp;=&nbsp;LX/cosθ&nbsp;+&nbsp;LY·tanθ&nbsp;&nbsp;&nbsp;&nbsp;[centidegrees]</span>
+
+<p>
+    These are converted internally to FWHM in degrees via
+    Γ<sub>G</sub>&nbsp;=&nbsp;σ·√(8·ln2)/100 and Γ<sub>L</sub>&nbsp;=&nbsp;2·HWHMₗ/100.
+</p>
 
 <dl>
     <dt>GU</dt><dd>Microstrain-like Gaussian broadening (∝ tan²θ).</dd>
@@ -273,13 +285,95 @@ footer {
     <dt>GP</dt><dd>Gaussian crystallite-size term (∝ 1/cos²θ). Rarely refined for X-rays.</dd>
     <dt>LX</dt><dd>Lorentzian crystallite-size broadening (∝ 1/cosθ).</dd>
     <dt>LY</dt><dd>Lorentzian microstrain broadening (∝ tanθ).</dd>
-    <dt>η</dt><dd>Pseudo-Voigt mixing fraction. η = 0 → pure Gaussian, η = 1 → pure Lorentzian.</dd>
+</dl>
+
+<div class="note">
+    <strong>Warning</strong>
+    Nothing prevents GU/GV/GW/GP from driving σ² negative (or LX/LY driving the Lorentzian HWHM
+    negative) at some angles. The width is floored at a near-delta value when that happens, and
+    the refinement will emit a warning to the console and to the PDF report. A fit that triggers
+    this warning is in an unphysical corner of parameter space and should not be trusted — fix or
+    re-start the offending coefficient rather than accepting the result.
+</div>
+
+<h2>Peak shape — profile function</h2>
+<p>
+    The <strong>Profile fn.</strong> selector on the Profile tab chooses how Γ<sub>G</sub> and
+    Γ<sub>L</sub> are combined into a single peak shape.
+</p>
+
+<h3>TCH pseudo-Voigt (default)</h3>
+<p>
+    The Thompson–Cox–Hastings approximation to the true Voigt function. A single effective width Γ
+    and a mixing fraction η are <em>derived</em> from the two component widths:
+</p>
+
+<span class="eq">Γ&nbsp;=&nbsp;(Γ<sub>G</sub>⁵&nbsp;+&nbsp;2.69269·Γ<sub>G</sub>⁴Γ<sub>L</sub>&nbsp;+&nbsp;2.42843·Γ<sub>G</sub>³Γ<sub>L</sub>²&nbsp;+&nbsp;4.47163·Γ<sub>G</sub>²Γ<sub>L</sub>³&nbsp;+&nbsp;0.07842·Γ<sub>G</sub>Γ<sub>L</sub>⁴&nbsp;+&nbsp;Γ<sub>L</sub>⁵)<sup>1/5</sup></span>
+<span class="eq">q&nbsp;=&nbsp;Γ<sub>L</sub>/Γ&nbsp;&nbsp;&nbsp;&nbsp;η&nbsp;=&nbsp;1.36603·q&nbsp;−&nbsp;0.47719·q²&nbsp;+&nbsp;0.11116·q³</span>
+
+<p>
+    Both the Gaussian and the Lorentzian component then share the same Γ. In this mode the
+    <code>η</code> input is disabled and its refinement flag is cleared: η is not a free parameter,
+    it is a function of the Caglioti coefficients. This is the physically correct behaviour and is
+    what you want in almost all cases.
+</p>
+
+<h3>Empirical pV (free η)</h3>
+<p>
+    A purely empirical mixture, in which the Gaussian keeps width Γ<sub>G</sub>, the Lorentzian
+    keeps width Γ<sub>L</sub>, and η is an independent refinable knob:
+</p>
+
+<span class="eq">pV(x)&nbsp;=&nbsp;η·L(x;&nbsp;Γ<sub>L</sub>)&nbsp;+&nbsp;(1−η)·G(x;&nbsp;Γ<sub>G</sub>)</span>
+
+<dl>
+    <dt>η</dt><dd>Mixing fraction, empirical mode only. η = 0 → pure Gaussian, η = 1 → pure Lorentzian.</dd>
 </dl>
 
 <p>
-    Both component profiles are <em>area</em>-normalised, so integrated intensities returned by
-    the Le Bail extraction do not depend on the peak width.
+    This form is self-consistent and area-normalised, but η is decoupled from the real Voigt
+    convolution, so the Caglioti coefficients no longer carry their usual physical meaning. Use it
+    only when you deliberately want an extra shape degree of freedom, and do not interpret LX/LY as
+    size/strain in that case. The profile function actually used is recorded in both the text and
+    PDF reports.
 </p>
+
+<h3>Normalisation and truncation</h3>
+<p>
+    Both forms are <em>area</em>-normalised, so the integrated intensities returned by the Le Bail
+    extraction do not depend on peak width or shape. Because a pseudo-Voigt is normalised over an
+    infinite range but can only be evaluated over a finite one, each peak is evaluated out to
+    ±15·FWHM and the small remaining truncation is then corrected analytically (an error function
+    for the Gaussian part, an arctangent for the Lorentzian part). Without that correction a
+    Lorentzian-dominated peak loses several percent of its area, and the loss depends on the width
+    — which would bias the intensity partitioning exactly where area normalisation is meant to
+    prevent it.
+</p>
+
+<h2>The Le Bail extraction</h2>
+<p>
+    At every refinement step the observed (background-subtracted) intensity is partitioned among
+    all contributing reflections in proportion to their <em>current</em> calculated contributions,
+    and the partition is iterated to self-consistency:
+</p>
+
+<span class="eq">I<sub>k</sub>(new)&nbsp;=&nbsp;Σ<sub>i</sub>&nbsp;y<sub>obs</sub>(i)&nbsp;·&nbsp;[&nbsp;I<sub>k</sub>·Ω<sub>k</sub>(i)&nbsp;]&nbsp;/&nbsp;Σ<sub>k'</sub>&nbsp;I<sub>k'</sub>·Ω<sub>k'</sub>(i)</span>
+
+<p>
+    Ω<sub>k</sub> is the normalised profile of reflection <em>k</em>. The intensity weighting is
+    what makes this Le Bail rather than a plain profile deconvolution: partitioning by Ω alone
+    would split every overlapping pair by width only — 50/50 for equal widths — and could never
+    recover the true intensity ratio. Twenty cycles are run per refinement step, and intensities
+    are carried forward between steps as a warm start. Reflections are initialised equal on the
+    first pass, per Le Bail's original prescription, and negative values are clamped to zero.
+</p>
+
+<div class="note">
+    <strong>Note</strong>
+    Extracted intensities are channel sums, so their absolute magnitude scales roughly as 1/Δ2θ
+    and will change if you re-bin your data. Ratios between reflections, and the fit itself, are
+    unaffected — an overall linear scale factor is determined analytically and absorbs it.
+</div>
 
 <h2>Sample displacement &amp; transparency</h2>
 <p>
@@ -307,15 +401,35 @@ footer {
 <h2>Diagnostics</h2>
 <dl>
     <dt>R<sub>p</sub></dt><dd>Profile residual: 100 · Σ|y<sub>obs</sub>−y<sub>calc</sub>| / Σ|y<sub>obs</sub>|.</dd>
-    <dt>R<sub>wp</sub></dt><dd>Weighted profile residual, with Poisson weights w<sub>i</sub> = 1/max(y<sub>i</sub>, 1). The quantity actually minimised by LM.</dd>
+    <dt>R<sub>wp</sub></dt><dd>Weighted profile residual, with Poisson weights w<sub>i</sub> = 1/max(y<sub>i</sub>, 1).</dd>
     <dt>χ²ᵣ</dt><dd>Reduced chi-squared, Σw·(y<sub>obs</sub>−y<sub>calc</sub>)² / (N−P). The goodness-of-fit GoF&nbsp;=&nbsp;√χ²ᵣ is shown alongside in the report.</dd>
 </dl>
 
 <p>
-    The difference curve (red, below the pattern) is the most informative diagnostic. Sinusoidal
-    residuals around peaks indicate an unfit cell parameter or zero offset; asymmetric residuals
-    indicate a profile-shape problem (try refining LX, LY, or η).
+    Both Levenberg–Marquardt and Simulated Annealing minimise the same weighted sum of squares,
+    using the same Poisson weights, with the overall linear scale factor profiled out analytically
+    (s&nbsp;=&nbsp;Σw·y<sub>obs</sub>·y<sub>calc</sub>&nbsp;/&nbsp;Σw·y<sub>calc</sub>²) so that the
+    arbitrary absolute level of the extracted intensities does not enter the residual.
 </p>
+
+<p>
+    The difference curve (red, below the pattern) is the most informative diagnostic. Sinusoidal
+    residuals around peaks indicate an unfit cell parameter or zero offset; symmetric residuals
+    that are too sharp or too broad at the peak top indicate a width problem (LX, LY, or the
+    Caglioti terms); residuals that change character systematically with 2θ point at the wrong
+    angular dependence rather than the wrong magnitude.
+</p>
+
+<div class="note">
+    <strong>On the ESDs</strong>
+    Standard deviations in the PDF report come from the Levenberg–Marquardt covariance matrix and
+    should be read as <em>lower bounds</em>. They are built from the profile-parameter Jacobian
+    only: the Le Bail intensities and the profiled-out scale factor are extra degrees of freedom
+    that absorb part of the residual but are not propagated. Le Bail refinements are inherently
+    optimistic this way — treat the numbers as a guide to relative precision, not as absolute
+    uncertainties. A singular matrix (reported as such) means two or more refined parameters are
+    completely correlated; fix one of them.
+</div>
 
 <h2>Plot interaction</h2>
 <ul>
@@ -329,16 +443,17 @@ footer {
 
 <h2>Output</h2>
 <p>
-    <strong>Save Data</strong> writes a tab-separated text file containing the experimental
-    intensity, the calculated total pattern, the refined background, and the difference, on the
-    full 2θ grid. <strong>Generate PDF</strong> produces a multi-page report including refined
-    parameters with their estimated standard deviations (from the LM covariance matrix), the full
-    list of reflections sorted by 2θ, and the data table.
+    <strong>Save Report</strong> writes a plain-text report containing the refined parameters, the
+    profile function used, the reflection list with calculated and nearest observed d-spacings and
+    2θ values, and a full data table of experimental intensity, calculated pattern, and difference
+    on the full 2θ grid. <strong>Generate PDF</strong> produces a multi-page report with the plot,
+    the refinement statistics, refined parameters with their estimated standard deviations (LM
+    only), and the reflection list sorted by 2θ.
 </p>
 
 <footer>
     <span>MISFIT · Le Bail two-phase refinement</span>
-    <span>NitaD · Univ. Paris-Saclay · last updated 28 april 2026 </span>
+    <span>NitaD · Univ. Paris-Saclay · last updated 19 july 2026 </span>
 </footer>
 
 </main>

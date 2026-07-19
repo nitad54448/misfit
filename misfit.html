@@ -364,6 +364,11 @@
                             <input type="checkbox" id="fit-ly" class="fit-checkbox">
 
                              <h3 class="profile-section-header">Peak Shape & Position</h3>
+                             <label class="control-label">Profile fn.</label>
+                            <select id="profile-mode" class="control-select" style="grid-column: 2 / -1;">
+                                <option value="tch" selected>TCH pseudo-Voigt (eta derived)</option>
+                                <option value="empirical">Empirical pV (free eta)</option>
+                            </select>
                              <label class="control-label">eta (Mixing)</label>
                             <input type="number" id="param-eta" value="0.74" step="0.01" min="0" max="1" class="control-input">
                             <input type="checkbox" id="fit-eta" class="fit-checkbox">
@@ -456,7 +461,7 @@
             </div>
 
             <div style="position: absolute; bottom: 0.5rem; right: 1rem; font-size: 0.75rem; color: #9ca3af;">
-                NitaD, Univ Paris-Saclay, 28 april 2026
+                NitaD, Univ Paris-Saclay, 19 July 2026
             </div>
         </div>
     </div>
@@ -480,6 +485,7 @@
             paramLX: document.getElementById('param-lx'), fitLX: document.getElementById('fit-lx'),
             paramLY: document.getElementById('param-ly'), fitLY: document.getElementById('fit-ly'),
             paramEta: document.getElementById('param-eta'), fitEta: document.getElementById('fit-eta'),
+            profileMode: document.getElementById('profile-mode'),
             paramShft: document.getElementById('param-shft'), fitShft: document.getElementById('fit-shft'),
             paramTrns: document.getElementById('param-trns'), fitTrns: document.getElementById('fit-trns'),
             algorithmSelect: document.getElementById('algorithm-select'),
@@ -913,19 +919,79 @@ const parsePhilipsUdfFile = (text) => {
         // dwarfs sensitivity to η or LX), and naive Gauss-Jordan inversion accumulates
         // cancellation errors that look like singularity. Trick: scale to D = diag(1/sqrt(diag)),
         // invert D·JtJ·D (well-conditioned), then unscale: cov = D·(D·JtJ·D)^-1·D.
-        function covarianceFromJtJ(JtJ) {
+        // Rank-revealing covariance. Returns { cov, dropped } where `cov` has NaN entries for
+        // any parameter that could not be determined, and `dropped` names those parameters.
+        //
+        // Previously a SINGLE degenerate parameter made this return null, which wiped out the
+        // ESDs of every other parameter as collateral damage. That is the wrong trade: if one
+        // parameter has no influence on the pattern (a dead Jacobian column), the remaining
+        // parameters are usually perfectly well determined and their ESDs are still meaningful.
+        // So instead of giving up, drop the offenders and invert the surviving submatrix.
+        function covarianceFromJtJ(JtJ, paramNames = []) {
             const n = JtJ.length;
             if (n === 0) return null;
-            const d = new Array(n);
+
+            // A dead column shows up as a zero (or non-finite) diagonal entry.
+            let active = [];
+            const dropped = [];
+            const nameOf = i => paramNames[i] || `#${i}`;
+            const diagMax = Math.max(...JtJ.map((r, i) => (isFinite(r[i]) ? Math.abs(r[i]) : 0)), 0);
             for (let i = 0; i < n; i++) {
                 const v = JtJ[i][i];
-                if (!isFinite(v) || v <= 0) return null;
-                d[i] = 1 / Math.sqrt(v);
+                if (!isFinite(v) || v <= 0 || (diagMax > 0 && v < 1e-14 * diagMax)) {
+                    dropped.push({ name: nameOf(i), reason: 'no influence on the pattern' });
+                } else {
+                    active.push(i);
+                }
             }
-            const M = Array.from({length: n}, (_, i) => Array.from({length: n}, (_, j) => JtJ[i][j] * d[i] * d[j]));
-            const Minv = matrixInverse(M);
-            if (!Minv) return null;
-            return Minv.map((row, i) => row.map((v, j) => v * d[i] * d[j]));
+
+            // Invert the scaled (correlation-form) submatrix, peeling off any parameter whose
+            // pivot collapses -- that is a parameter perfectly correlated with the others.
+            let subInv = null;
+            while (active.length > 0) {
+                const d = active.map(i => 1 / Math.sqrt(JtJ[i][i]));
+                const M = active.map((i, ii) => active.map((j, jj) => JtJ[i][j] * d[ii] * d[jj]));
+                const res = matrixInverseRank(M);
+                if (res.ok) {
+                    subInv = res.inv.map((row, ii) => row.map((v, jj) => v * d[ii] * d[jj]));
+                    break;
+                }
+                const bad = active[res.failIndex];
+                dropped.push({ name: nameOf(bad), reason: 'fully correlated with another refined parameter' });
+                active = active.filter(i => i !== bad);
+            }
+            if (!subInv) return { cov: null, dropped };
+
+            const cov = Array.from({ length: n }, () => new Array(n).fill(NaN));
+            active.forEach((i, ii) => active.forEach((j, jj) => { cov[i][j] = subInv[ii][jj]; }));
+            return { cov, dropped };
+        }
+
+        // Gauss-Jordan inversion that reports WHICH pivot failed instead of just giving up.
+        function matrixInverseRank(A) {
+            const n = A.length;
+            if (n === 0) return { ok: false, failIndex: 0 };
+            const C = A.map((row, i) => [...row, ...Array.from({ length: n }, (_, j) => (i === j ? 1 : 0))]);
+            for (let i = 0; i < n; i++) {
+                let pivot = i;
+                for (let j = i + 1; j < n; j++) if (Math.abs(C[j][i]) > Math.abs(C[pivot][i])) pivot = j;
+                [C[i], C[pivot]] = [C[pivot], C[i]];
+                const div = C[i][i];
+                // The matrix is in correlation form (unit diagonal), so this tolerance is a
+                // genuine, scale-free test of linear dependence. Row swaps permute rows only,
+                // never columns, so a collapsed pivot in column i implicates parameter i.
+                if (!isFinite(div) || Math.abs(div) < 1e-10) return { ok: false, failIndex: i };
+                for (let j = i; j < 2 * n; j++) C[i][j] /= div;
+                for (let j = 0; j < n; j++) {
+                    if (i !== j) {
+                        const mult = C[j][i];
+                        for (let k = i; k < 2 * n; k++) C[j][k] -= mult * C[i][k];
+                    }
+                }
+            }
+            // Row swaps are legitimate row operations on [A|I], so the left block ends as an
+            // exact identity and the right block is A^-1 already in natural order.
+            return { ok: true, inv: C.map(row => row.slice(n)) };
         }
 
         function findExperimentalPeakDetails(targetTth, experimentalData, wavelength, searchWindow = 0.5) {
@@ -1026,15 +1092,20 @@ const parsePhilipsUdfFile = (text) => {
                 const P = fitResults.paramMapping.length;
                 if (N > P && fitResults.ss_res !== undefined) {
                     const reduced_chi_sq = fitResults.ss_res / (N - P);
-                    const cov_matrix = covarianceFromJtJ(fitResults.JtJ);
+                    const covResult = covarianceFromJtJ(fitResults.JtJ, fitResults.paramMapping.map(p => p.name));
+                    const cov_matrix = covResult ? covResult.cov : null;
                     if (cov_matrix) {
                         fitResults.paramMapping.forEach((p, i) => {
-                            if (cov_matrix[i] && cov_matrix[i][i] !== undefined) {
-                                esds[p.name] = Math.sqrt(Math.abs(reduced_chi_sq * cov_matrix[i][i]));
-                            }
+                            const v = cov_matrix[i] && cov_matrix[i][i];
+                            if (isFinite(v)) esds[p.name] = Math.sqrt(Math.abs(reduced_chi_sq * v));
                         });
-                    } else {
-                        esdWarning = "--> ESD calculation failed: matrix is singular (check for correlated parameters).";
+                    }
+                    if (covResult && covResult.dropped.length) {
+                        esdWarning = '--> No ESD could be determined for: '
+                            + covResult.dropped.map(d => `${d.name} (${d.reason})`).join(', ')
+                            + '. Other parameters are unaffected.';
+                    } else if (!cov_matrix) {
+                        esdWarning = '--> ESD calculation failed: the normal matrix could not be inverted.';
                     }
                 }
             }
@@ -1060,6 +1131,8 @@ const parsePhilipsUdfFile = (text) => {
             reportLines.push(`Rwp (%):     ${stats.rwp.toFixed(4)}`);
             reportLines.push(`Reduced χ²: ${stats.chi2.toFixed(4)}    (GoF = √χ²ᵣ = ${Math.sqrt(Math.max(0, stats.chi2)).toFixed(4)})`);
             reportLines.push(`Algorithm:   ${algorithm === 'lm' ? 'Levenberg-Marquardt' : 'Simulated Annealing'}`);
+            if (fitResults.cellWarning) { reportLines.push('!!! ' + fitResults.cellWarning); }
+            if (fitResults.widthWarning) { reportLines.push('!!! ' + fitResults.widthWarning); }
             if (esdWarning) reportLines.push(esdWarning);
             reportLines.push('');
 
@@ -1093,6 +1166,7 @@ const parsePhilipsUdfFile = (text) => {
             
             // --- Shared Parameters ---
             reportLines.push('--- Shared & Profile Parameters ---');
+            reportLines.push(`Profile function: ${fitResults.profileMode === 'empirical' ? 'Empirical pseudo-Voigt (free eta)' : 'Thompson-Cox-Hastings pseudo-Voigt (eta derived)'}`);
             reportLines.push(header);
             reportLines.push('-'.repeat(header.length + 2));
             reportLines.push(`Radiation (Å): ${finalParams.lambda}`);
@@ -1149,6 +1223,59 @@ const parsePhilipsUdfFile = (text) => {
         }
 
 
+        // 1/d^2 for a given (hkl) and cell. Factored out of generateHKL so that peak POSITIONS
+        // can be recomputed from perturbed lattice parameters without rebuilding the whole
+        // reflection list -- which is what the Levenberg-Marquardt Jacobian needs.
+        function invDSq(h, k, l, p, system) {
+            const deg2rad = Math.PI / 180;
+            const { a, b, c, alpha, beta } = p;
+            switch (system) {
+                case 'cubic':        return (h*h + k*k + l*l) / (a*a);
+                case 'tetragonal':   return (h*h + k*k) / (a*a) + (l*l) / (c*c);
+                case 'orthorhombic': return (h*h)/(a*a) + (k*k)/(b*b) + (l*l)/(c*c);
+                case 'hexagonal':    return (4/3) * (h*h + h*k + k*k) / (a*a) + (l*l) / (c*c);
+                case 'monoclinic': {
+                    const bt = (beta || 90) * deg2rad;
+                    const sin_b_sq = Math.sin(bt) ** 2;
+                    if (sin_b_sq < 1e-9) return NaN;
+                    return (1/sin_b_sq) * ( (h*h)/(a*a) + (k*k*sin_b_sq)/(b*b) + (l*l)/(c*c) - (2*h*l*Math.cos(bt))/(a*c) );
+                }
+                case 'rhombohedral': {
+                    const al = (alpha || 90) * deg2rad;
+                    const cos_a = Math.cos(al);
+                    const den = a*a * (1 - 3*cos_a**2 + 2*cos_a**3);
+                    if (Math.abs(den) < 1e-9) return NaN;
+                    return ((h*h + k*k + l*l) * Math.sin(al)**2 + 2 * (h*k + k*l + l*h) * (cos_a**2 - cos_a)) / den;
+                }
+                default: return NaN;
+            }
+        }
+
+        // Recompute the 2-theta of an already-built reflection list from (possibly perturbed)
+        // lattice parameters, keeping the extracted intensities frozen.
+        //
+        // THIS IS ESSENTIAL FOR LM. calculateNetPattern reads each peak's position from the
+        // stored `tth`, which is baked in when the list is generated. Without this refresh,
+        // perturbing a, b, c or an angle changed nothing at all in the calculated pattern, every
+        // lattice-parameter column of the Jacobian was identically zero, and LM silently refined
+        // nothing but the zero shift and the profile terms (while also making the normal matrix
+        // singular, so no ESDs could be reported either).
+        function refreshReflectionPositions(hklList, params) {
+            const lambda = parseFloat(controls.wavelength.value);
+            const out = [];
+            for (const p of hklList) {
+                if (p.h === undefined) { out.push(p); continue; }
+                const ph = p.phase === 'P2' ? params.phase2 : params.phase1;
+                const inv_d_sq = invDSq(p.h, p.k, p.l, ph, p.system);
+                if (!(inv_d_sq > 0) || !isFinite(inv_d_sq)) continue;
+                const sinThetaSq = (lambda*lambda / 4) * inv_d_sq;
+                if (!(sinThetaSq <= 1)) continue;
+                const tth = 2 * Math.asin(Math.sqrt(sinThetaSq)) * (180 / Math.PI);
+                out.push({ ...p, tth, d: 1 / Math.sqrt(inv_d_sq) });
+            }
+            return out;
+        }
+
         function generateHKL(maxTth, phaseParams, system, centering, phaseTag) {
             const { a, b, c, alpha, beta } = phaseParams;
             const lambda = parseFloat(controls.wavelength.value);
@@ -1181,28 +1308,8 @@ const parsePhilipsUdfFile = (text) => {
                 }
                 if (!allowed) continue;
 
-                let inv_d_sq = 0;
-                try {
-                    switch(system) {
-                        case 'cubic': inv_d_sq = (h*h + k*k + l*l) / (a*a); break;
-                        case 'tetragonal': inv_d_sq = (h*h + k*k) / (a*a) + (l*l) / (c*c); break;
-                        case 'orthorhombic': inv_d_sq = (h*h)/(a*a) + (k*k)/(b*b) + (l*l)/(c*c); break;
-                        case 'hexagonal': inv_d_sq = (4/3) * (h*h + h*k + k*k) / (a*a) + (l*l) / (c*c); break;
-                        case 'monoclinic': 
-                            const sin_b_sq = Math.sin((beta || 90) * deg2rad)**2;
-                            if (sin_b_sq < 1e-9) continue;
-                            inv_d_sq = (1/sin_b_sq) * ( (h*h)/(a*a) + (k*k*sin_b_sq)/(b*b) + (l*l)/(c*c) - (2*h*l*Math.cos((beta || 90)*deg2rad))/(a*c) );
-                            break;
-                        case 'rhombohedral':
-                            const cos_a = Math.cos((alpha || 90) * deg2rad);
-                            const denominator = a*a * (1 - 3*cos_a**2 + 2*cos_a**3);
-                            if(Math.abs(denominator) < 1e-9) continue;
-                            inv_d_sq = ((h*h + k*k + l*l) * Math.sin((alpha || 90)*deg2rad)**2 + 2 * (h*k + k*l + l*h) * (cos_a**2 - cos_a)) / denominator;
-                            break;
-                    }
-                } catch (e) { continue; }
-
-                if (inv_d_sq <= 0 || !isFinite(inv_d_sq)) continue;
+                const inv_d_sq = invDSq(h, k, l, phaseParams, system);
+                if (!(inv_d_sq > 0) || !isFinite(inv_d_sq)) continue;
                 
                 const sinThetaSq = (lambda*lambda / 4) * inv_d_sq;
                 if (sinThetaSq <= 1) {
@@ -1211,7 +1318,12 @@ const parsePhilipsUdfFile = (text) => {
                     const d = 1 / Math.sqrt(inv_d_sq);
                     const key = `${phaseTag}-${Math.round(tth * 1000)}`;
                     if (!reflections.has(key)) {
-                        reflections.set(key, { tth: tth, d: d, hkl_list: [`(${h},${k},${l})`], intensity: 0, phase: phaseTag });
+                        // h,k,l of the representative reflection are retained so the position
+                        // can be recomputed when the cell is perturbed. Symmetry-equivalents
+                        // sharing this 2-theta may split under a perturbation, but for a
+                        // finite-difference step that is a second-order effect.
+                        reflections.set(key, { tth: tth, d: d, hkl_list: [`(${h},${k},${l})`], intensity: 0,
+                                               phase: phaseTag, h, k, l, system });
                     } else {
                         reflections.get(key).hkl_list.push(`(${h},${k},${l})`);
                     }
@@ -1232,94 +1344,250 @@ const parsePhilipsUdfFile = (text) => {
             return displShift + transShift;
         }
 
+        // ---------------------------------------------------------------------------
+        // PROFILE CORE
+        // ---------------------------------------------------------------------------
+
+        // Counts how many times sigma^2 came out non-positive during the last evaluation
+        // pass. A non-zero value means GU/GV/GW/GP are in an unphysical corner of parameter
+        // space and the width was floored -- the fit is not trustworthy there.
+        let profileWidthWarnings = 0;
+        function resetProfileWarnings() { profileWidthWarnings = 0; }
+
         // GSAS Profile 4 conventions (Larson & Von Dreele LAUR 86-748):
         //   sigma^2 [centidegrees^2] = GU*tan^2(theta) + GV*tan(theta) + GW + GP/cos^2(theta)
         //   HWHM_L  [centidegrees]   = LX/cos(theta) + LY*tan(theta)
         // Convert to FWHM in degrees:
         //   FWHM_G [deg] = sigma * sqrt(8*ln 2) / 100
         //   FWHM_L [deg] = 2 * HWHM_L / 100
+        const SQRT_8LN2 = Math.sqrt(8 * Math.log(2));
+
         function calculateProfileWidths(tth, params) {
             const thetaRad = Math.min(tth * (Math.PI / 180) / 2, 89.999 * Math.PI / 180);
             const tanTheta = Math.tan(thetaRad);
             const cosTheta = Math.cos(thetaRad);
-            const SQRT_8LN2 = Math.sqrt(8 * Math.log(2));
 
             // Gaussian variance in centidegrees^2
             const sigma_sq_cd = params.GU*tanTheta*tanTheta + params.GV*tanTheta + params.GW + params.GP/(cosTheta*cosTheta);
+            if (!(sigma_sq_cd > 0)) profileWidthWarnings++;   // unphysical: flag rather than silently floor
             const sigma_cd = Math.sqrt(Math.max(1e-9, sigma_sq_cd));   // sigma in centidegrees
             const fwhm_G_deg = sigma_cd * SQRT_8LN2 / 100.0;            // FWHM_G in degrees
 
             // Lorentzian HWHM in centidegrees -> FWHM in degrees
             const hwhm_L_cd = (params.LX / cosTheta) + (params.LY * tanTheta);
+            if (hwhm_L_cd < 0) profileWidthWarnings++;
             const fwhm_L_deg = 2.0 * Math.max(0, hwhm_L_cd) / 100.0;
 
             return { gamma_G: fwhm_G_deg, gamma_L: fwhm_L_deg };
         }
 
-        // Area-normalized pseudo-Voigt (∫pV dx = 1).
-        // Standard GSAS / Thompson-Cox-Hastings convention:
-        //   pV(x) = eta * L_normalized(x; FWHM_L) + (1 - eta) * G_normalized(x; FWHM_G)
-        // with each component integrating to unity. eta=1 -> pure Lorentzian, eta=0 -> pure Gaussian.
-        // Using area-normalized profiles is essential for Le Bail intensity partitioning to be
-        // unbiased w.r.t. peak width.
-        function pseudoVoigt(x, x0, fwhm_G, fwhm_L, eta) {
-            if (fwhm_G <= 1e-9 && fwhm_L <= 1e-9) return 0.0;
-            const dx = x - x0;
-            // Gaussian: G(x) = (1 / (sigma*sqrt(2*pi))) * exp(-dx^2 / (2 sigma^2))
-            // sigma = FWHM_G / sqrt(8 ln 2)
-            const sigma = fwhm_G / Math.sqrt(8 * Math.log(2));
-            const gauss = (sigma > 1e-9)
-                ? Math.exp(-0.5 * (dx / sigma) ** 2) / (sigma * Math.sqrt(2 * Math.PI))
-                : 0.0;
-            // Lorentzian: L(x) = (1/pi) * (gamma) / (dx^2 + gamma^2) where gamma = HWHM = FWHM_L/2
-            const gamma = fwhm_L / 2.0;
-            const lorentz = (gamma > 1e-9)
-                ? (gamma / Math.PI) / (dx * dx + gamma * gamma)
-                : 0.0;
-            if (fwhm_L < 1e-9) return gauss;
-            if (fwhm_G < 1e-9) return lorentz;
-            return eta * lorentz + (1 - eta) * gauss;
+        // Abramowitz & Stegun 7.1.26 -- needed for the analytic Gaussian truncation area.
+        function erf(x) {
+            const sign = x < 0 ? -1 : 1;
+            x = Math.abs(x);
+            const t = 1 / (1 + 0.3275911 * x);
+            const y = 1 - (((((1.061405429 * t - 1.453152027) * t) + 1.421413741) * t - 0.284496736) * t + 0.254829592) * t * Math.exp(-x * x);
+            return sign * y;
         }
-        
-        function calculateNetPattern(tthAxis, hklList, params) {
-            const pattern = new Float32Array(tthAxis.length).fill(0);
-            hklList.forEach(peak => {
+
+        // Thompson-Cox-Hastings: derive a SINGLE effective FWHM and mixing parameter from the
+        // separate Gaussian and Lorentzian widths (J. Appl. Cryst. 20 (1987) 79).
+        // This is the physically correct Voigt approximation; both components share Gamma.
+        function tchMix(fwhm_G, fwhm_L) {
+            const G = fwhm_G, L = fwhm_L;
+            const G2 = G*G, G3 = G2*G, G4 = G3*G, G5 = G4*G;
+            const L2 = L*L, L3 = L2*L, L4 = L3*L, L5 = L4*L;
+            const Gamma = Math.pow(G5 + 2.69269*G4*L + 2.42843*G3*L2 + 4.47163*G2*L3 + 0.07842*G*L4 + L5, 0.2);
+            if (!(Gamma > 1e-12)) return { fwhm: 0, eta: 0 };
+            const q = L / Gamma;
+            let eta = 1.36603*q - 0.47719*q*q + 0.11116*q*q*q;
+            eta = Math.max(0, Math.min(1, eta));
+            return { fwhm: Gamma, eta };
+        }
+
+        // Half-width of the evaluation window, in units of the governing FWHM. The pseudo-Voigt
+        // is normalized over an INFINITE range, but we can only afford to evaluate it over a
+        // finite one. Rather than silently losing the (Lorentzian-dominated) tail area -- which
+        // reintroduces exactly the width/eta bias that area-normalization is meant to remove --
+        // the window is made generous AND the residual truncation is corrected analytically.
+        const WINDOW_FWHM = 15;
+
+        // Builds a reusable, area-normalized, truncation-corrected peak profile.
+        //   mode 'tch'       -> Thompson-Cox-Hastings; params.eta is ignored (eta is derived)
+        //   mode 'empirical' -> free eta mixing independent G/L widths (legacy behaviour)
+        // The returned object exposes halfWindow and eval(dx). Because the normalization
+        // constants are precomputed once per peak rather than per data point, this is also
+        // considerably faster than the old per-point pseudoVoigt call.
+        function makePeakProfile(fwhm_G, fwhm_L, etaParam, mode) {
+            let gW, lW, eta;
+            if (mode === 'empirical') {
+                gW = fwhm_G; lW = fwhm_L; eta = Math.max(0, Math.min(1, etaParam));
+            } else {
+                const m = tchMix(fwhm_G, fwhm_L);
+                gW = m.fwhm; lW = m.fwhm; eta = m.eta;
+            }
+
+            const sigma = gW / SQRT_8LN2;               // Gaussian sigma
+            const gamma = lW / 2.0;                     // Lorentzian HWHM
+            const hasG = sigma > 1e-9, hasL = gamma > 1e-9;
+
+            if (!hasG && !hasL) return { halfWindow: 0, eval: () => 0 };
+            if (!hasL) eta = 0;
+            if (!hasG) eta = 1;
+
+            const halfWindow = WINDOW_FWHM * Math.max(gW, lW, 1e-9);
+
+            // Fraction of each normalized component's area that actually falls inside the
+            // window. Dividing by the mixed fraction restores unit area over the window.
+            const gFrac = hasG ? erf(halfWindow / (sigma * Math.SQRT2)) : 0;
+            const lFrac = hasL ? (2 / Math.PI) * Math.atan(halfWindow / gamma) : 0;
+            const areaInWindow = eta * lFrac + (1 - eta) * gFrac;
+            const renorm = areaInWindow > 1e-6 ? 1 / areaInWindow : 1;
+
+            const gNorm = hasG ? (1 - eta) * renorm / (sigma * Math.sqrt(2 * Math.PI)) : 0;
+            const inv2s2 = hasG ? 0.5 / (sigma * sigma) : 0;
+            const lNorm = hasL ? eta * renorm * gamma / Math.PI : 0;
+            const gamma2 = gamma * gamma;
+
+            return {
+                halfWindow,
+                eta,
+                eval(dx) {
+                    let v = 0;
+                    if (gNorm) v += gNorm * Math.exp(-inv2s2 * dx * dx);
+                    if (lNorm) v += lNorm / (dx * dx + gamma2);
+                    return v;
+                }
+            };
+        }
+
+        // Thin wrapper kept for any external/legacy callers.
+        function pseudoVoigt(x, x0, fwhm_G, fwhm_L, eta, mode) {
+            return makePeakProfile(fwhm_G, fwhm_L, eta, mode || getProfileMode()).eval(x - x0);
+        }
+
+        function getProfileMode() {
+            return (controls.profileMode && controls.profileMode.value === 'empirical') ? 'empirical' : 'tch';
+        }
+
+        // Precomputes, for every reflection, its corrected position, its profile object, and
+        // the inclusive index range of the tth axis that lies inside its evaluation window.
+        // Shared by the pattern calculation and the Le Bail extraction so the two can never
+        // drift out of sync (they previously duplicated the window logic).
+        function buildPeakContexts(tthAxis, hklList, params) {
+            const mode = getProfileMode();
+            const n = tthAxis.length;
+            const step = n > 1 ? (tthAxis[n - 1] - tthAxis[0]) / (n - 1) : 1;
+            const ctx = [];
+            for (let k = 0; k < hklList.length; k++) {
+                const peak = hklList[k];
                 const basePos = peak.tth + params.zeroShift;
                 const peakPos = basePos + calculatePeakShift(basePos, params);
                 const { gamma_G, gamma_L } = calculateProfileWidths(basePos, params);
-                for (let i = 0; i < tthAxis.length; i++) {
-                    if (Math.abs(tthAxis[i] - peakPos) < 5 * (gamma_G + gamma_L)) {
-                       pattern[i] += peak.intensity * pseudoVoigt(tthAxis[i], peakPos, gamma_G, gamma_L, params.eta);
-                    }
+                const prof = makePeakProfile(gamma_G, gamma_L, params.eta, mode);
+                if (prof.halfWindow <= 0) { ctx.push(null); continue; }
+                let i0 = Math.floor((peakPos - prof.halfWindow - tthAxis[0]) / step);
+                let i1 = Math.ceil((peakPos + prof.halfWindow - tthAxis[0]) / step);
+                i0 = Math.max(0, i0); i1 = Math.min(n - 1, i1);
+                if (i1 < i0) { ctx.push(null); continue; }
+                ctx.push({ peakIdx: k, peakPos, prof, i0, i1 });
+            }
+            return ctx;
+        }
+
+        function calculateNetPattern(tthAxis, hklList, params) {
+            const pattern = new Float32Array(tthAxis.length).fill(0);
+            const contexts = buildPeakContexts(tthAxis, hklList, params);
+            for (const c of contexts) {
+                if (!c) continue;
+                const I = hklList[c.peakIdx].intensity;
+                if (!(I > 0)) continue;
+                for (let i = c.i0; i <= c.i1; i++) {
+                    pattern[i] += I * c.prof.eval(tthAxis[i] - c.peakPos);
                 }
-            });
+            }
             return pattern;
         }
 
-        function leBailIntensityExtraction(exp_net, hklList, params) {
-            hklList.forEach(p => p.intensity = 0);
-            for(let i = 0; i < exp_net.tth.length; i++) {
-                let totalProfileAtPoint = 0;
-                const contributingPeaks = [];
-                hklList.forEach((peak, peakIdx) => {
-                    const basePos = peak.tth + params.zeroShift;
-                    const peakPos = basePos + calculatePeakShift(basePos, params);
-                    const { gamma_G, gamma_L } = calculateProfileWidths(basePos, params);
-                    if(Math.abs(exp_net.tth[i] - peakPos) < 5 * (gamma_G + gamma_L)) {
-                        const profileVal = pseudoVoigt(exp_net.tth[i], peakPos, gamma_G, gamma_L, params.eta);
-                        totalProfileAtPoint += profileVal;
-                        contributingPeaks.push({idx: peakIdx, val: profileVal});
-                    }
-                });
-                if(totalProfileAtPoint > 1e-9) {
-                    const obsIntensityNet = exp_net.intensity[i]; // Already background-subtracted
-                    contributingPeaks.forEach(p => {
-                        hklList[p.idx].intensity += obsIntensityNet * (p.val / totalProfileAtPoint);
-                    });
-                }
+        // ---------------------------------------------------------------------------
+        // LE BAIL INTENSITY EXTRACTION
+        //
+        // The defining feature of the Le Bail algorithm is that observed intensity at each
+        // point is partitioned among overlapping reflections in proportion to their CURRENT
+        // calculated contributions, I_k * Omega_k(i) -- not by profile shape alone. The
+        // partition is then iterated to self-consistency:
+        //
+        //   I_k(new) = SUM_i  y_obs(i) * [ I_k(old) * Omega_k(i) ] / SUM_k' I_k'(old) * Omega_k'(i)
+        //
+        // Partitioning by Omega alone (the previous behaviour) splits every overlapping pair
+        // by width only -- 50/50 for equal widths -- and can never recover the true intensity
+        // ratio, no matter how good the lattice parameters are.
+        // ---------------------------------------------------------------------------
+        // Number of partition iterations. The omega values are cached, so extra cycles cost only
+        // a couple of cheap passes -- and heavily overlapped reflections need well over 5 to
+        // converge (a 0.3-FWHM-separated 3:1 doublet reaches ratio 1.6 at 5 cycles, 2.9 at 20).
+        const LEBAIL_CYCLES = 20;
+
+        function leBailIntensityExtraction(exp_net, hklList, params, cycles = LEBAIL_CYCLES) {
+            const M = hklList.length;
+            if (M === 0) return;
+            const tth = exp_net.tth;
+            const yobs = exp_net.intensity;
+            const N = tth.length;
+
+            const contexts = buildPeakContexts(tth, hklList, params).filter(Boolean);
+            if (contexts.length === 0) { hklList.forEach(p => p.intensity = 0); return; }
+
+            // Cache Omega_k(i) once; the iteration below only reweights it.
+            for (const c of contexts) {
+                const len = c.i1 - c.i0 + 1;
+                const arr = new Float64Array(len);
+                for (let i = c.i0; i <= c.i1; i++) arr[i - c.i0] = c.prof.eval(tth[i] - c.peakPos);
+                c.omega = arr;
             }
-            // No renormalization: intensities stay on the natural data scale, which makes the
-            // optimal scale factor in calculateStatistics / LM cost converge to ~1.
+
+            // Le Bail's standard start: all intensities equal. Any previously extracted,
+            // strictly positive intensities are reused as a better starting point.
+            const I = new Float64Array(M);
+            let anyPositive = false;
+            for (let k = 0; k < M; k++) {
+                const v = hklList[k].intensity;
+                if (Number.isFinite(v) && v > 0) { I[k] = v; anyPositive = true; }
+            }
+            if (!anyPositive) I.fill(1);
+
+            const sumCalc = new Float64Array(N);
+            const Inew = new Float64Array(M);
+
+            for (let cyc = 0; cyc < cycles; cyc++) {
+                sumCalc.fill(0);
+                for (const c of contexts) {
+                    const Ik = I[c.peakIdx];
+                    if (!(Ik > 0)) continue;
+                    for (let i = c.i0; i <= c.i1; i++) sumCalc[i] += Ik * c.omega[i - c.i0];
+                }
+
+                Inew.fill(0);
+                for (const c of contexts) {
+                    const Ik = I[c.peakIdx];
+                    if (!(Ik > 0)) continue;
+                    let acc = 0;
+                    for (let i = c.i0; i <= c.i1; i++) {
+                        const S = sumCalc[i];
+                        if (S > 1e-12) acc += yobs[i] * (Ik * c.omega[i - c.i0]) / S;
+                    }
+                    Inew[c.peakIdx] = acc;
+                }
+
+                // Background-subtracted data can dip negative; a negative structure factor is
+                // meaningless, so clamp at zero but keep a floor so a reflection that is
+                // momentarily starved can recover on a later cycle.
+                for (let k = 0; k < M; k++) I[k] = Inew[k] > 0 ? Inew[k] : 0;
+            }
+
+            for (let k = 0; k < M; k++) hklList[k].intensity = I[k];
+            // No overall renormalization: intensities stay on the natural data scale, so the
+            // optimal linear scale factor computed downstream converges to ~1.
         }
 
         function calculateStatistics(totalWorkingData, netCalcPattern, backgroundSlice, fitFlags) {
@@ -1411,6 +1679,7 @@ const parsePhilipsUdfFile = (text) => {
             await new Promise(resolve => setTimeout(resolve, 10));
             
             updateAndApplyBackground();
+            resetProfileWarnings();
 
             let params = getAllParams();
             const fitFlags = getFitFlags();
@@ -1452,6 +1721,7 @@ const parsePhilipsUdfFile = (text) => {
             let combinedHklList = hklList1.concat(hklList2).sort((a,b)=>a.tth-b.tth);
             lastGeneratedHklList = combinedHklList;
             
+            resetProfileWarnings();
             leBailIntensityExtraction(workingData, combinedHklList, finalParams);
             
             const finalWorkingPattern_NET = calculateNetPattern(workingData.tth, combinedHklList, finalParams);
@@ -1464,6 +1734,43 @@ const parsePhilipsUdfFile = (text) => {
 
             const finalStats = calculateStatistics(finalWorkingData_TOTAL, finalWorkingPattern_NET, background_slice, fitFlags);
             fitResults.stats = finalStats;
+            fitResults.profileMode = getProfileMode();
+
+            // A phase that generates (almost) no reflections in the fitted range contributes
+            // nothing to the residual. Its parameters then have dead Jacobian columns, the ESDs
+            // collapse, and the "good" Rwp is really being carried by the other phase alone.
+            // This is the classic runaway-cell failure and it must not pass silently.
+            const phaseChecks = [];
+            [[1, hklList1, finalParams.phase1], [2, hklList2, finalParams.phase2]].forEach(([n, list, ph]) => {
+                if (list.length < 3) {
+                    phaseChecks.push(`Phase ${n} generates only ${list.length} reflection(s) in the fitted 2-theta range. `
+                        + `Its cell is almost certainly wrong (a runaway refinement), and the fit statistics reflect the other phase only.`);
+                }
+                ['alpha', 'beta', 'gamma'].forEach(ang => {
+                    const v = ph[ang];
+                    // Angles that do not exist for the chosen Bravais system come back as NaN
+                    // from parseFloat, and the JSON deep-copy used by the refiners turns NaN
+                    // into null. Beware: isFinite(null) is TRUE and null < 60 is TRUE, so a
+                    // `v !== undefined && isFinite(v)` guard lets null straight through and
+                    // v.toFixed() then throws. Test the type explicitly.
+                    if (typeof v === 'number' && Number.isFinite(v) && (v < 60 || v > 140)) {
+                        phaseChecks.push(`Phase ${n} ${ang} = ${v.toFixed(4)} deg is outside the plausible range for a real cell (60-140 deg).`);
+                    }
+                });
+            });
+            if (phaseChecks.length) {
+                fitResults.cellWarning = phaseChecks.join(' ');
+                console.warn(fitResults.cellWarning);
+            }
+
+            // Surface unphysical profile widths rather than silently flooring them.
+            if (profileWidthWarnings > 0) {
+                fitResults.widthWarning = 'Warning: the Gaussian variance (GU/GV/GW/GP) or Lorentzian HWHM (LX/LY) '
+                    + 'went non-positive at some 2-theta values during the final evaluation. The width was floored at a '
+                    + 'near-delta value there, so these profile parameters are outside their physically meaningful range '
+                    + 'and the reported fit should not be trusted.';
+                console.warn(fitResults.widthWarning);
+            }
             
             const scaledPeakPattern_full = calculateNetPattern(fullExperimentalData.tth, combinedHklList, finalParams).map(y => y * finalStats.scaleFactor);
             
@@ -1501,32 +1808,55 @@ const parsePhilipsUdfFile = (text) => {
             return x;
         }
 
+        // Lattice and profile parameters are refined WITHOUT artificial bounds: the refinement
+        // is free to go wherever the data takes it. The only clamps retained are the ones that
+        // keep a quantity mathematically meaningful (a negative Lorentzian width or an eta
+        // outside [0,1] is not a "large" value, it is an undefined one).
+        // Each entry carries three distinct scalars that were previously conflated:
+        //   step   - finite-difference increment for the LM Jacobian (small, numerical)
+        //   saStep - characteristic move size for the Simulated Annealing random walk (large,
+        //            physical: it must be comparable to how wrong the starting guess might be)
+        //   clamp  - keeps a quantity mathematically DEFINED (a negative cell edge or an eta
+        //            outside [0,1] is meaningless, not merely large). These are not bounds on
+        //            the refinement; nothing restricts how far a parameter may travel.
+        const IDENT = v => v;
+        const POSITIVE = v => Math.max(1e-6, v);
+        const NONNEG = v => Math.max(0, v);
+        const UNIT = v => Math.max(0, Math.min(1, v));
+
         function getParameterMapping(fitFlags, constraints) {
             const paramMapping = [];
             const latticeParamNames = ['a', 'b', 'c', 'alpha', 'beta', 'gamma'];
             latticeParamNames.forEach(pName => {
+                const isEdge = ['a', 'b', 'c'].includes(pName);
+                const step   = isEdge ? 1e-3  : 1e-2;
+                const saStep = isEdge ? 0.02  : 0.2;    // 0.02 A / 0.2 deg per SA move
+                const clamp  = isEdge ? POSITIVE : IDENT;
                 if (constraints[`constrain_${pName}`]) {
                     if (fitFlags.phase1[pName] || fitFlags.phase2[pName]) {
                         paramMapping.push({
                             name: `${pName}_shared`,
                             get: p => p.phase1[pName],
-                            set: (p, v) => { p.phase1[pName] = v; p.phase2[pName] = v; },
-                            step: ['a', 'b', 'c'].includes(pName) ? 1e-3 : 1e-2
+                            set: (p, v) => { const c = clamp(v); p.phase1[pName] = c; p.phase2[pName] = c; },
+                            step, saStep, clamp
                         });
                     }
                 } else {
-                    if (fitFlags.phase1[pName]) paramMapping.push({ name: `${pName}1`, get: p => p.phase1[pName], set: (p, v) => p.phase1[pName] = v, step: ['a','b','c'].includes(pName) ? 1e-3: 1e-2 });
-                    if (fitFlags.phase2[pName]) paramMapping.push({ name: `${pName}2`, get: p => p.phase2[pName], set: (p, v) => p.phase2[pName] = v, step: ['a','b','c'].includes(pName) ? 1e-3: 1e-2 });
+                    if (fitFlags.phase1[pName]) paramMapping.push({ name: `${pName}1`, get: p => p.phase1[pName], set: (p, v) => p.phase1[pName] = clamp(v), step, saStep, clamp });
+                    if (fitFlags.phase2[pName]) paramMapping.push({ name: `${pName}2`, get: p => p.phase2[pName], set: (p, v) => p.phase2[pName] = clamp(v), step, saStep, clamp });
                 }
             });
             const sharedParamDefs = [
-                { flag: fitFlags.zeroShift, name: 'zeroShift', get: p => p.zeroShift, set: (p, v) => p.zeroShift = v, step: 1e-3 },
-                { flag: fitFlags.GU, name: 'GU', get: p => p.GU, set: (p, v) => p.GU = v, step: 0.1 }, { flag: fitFlags.GV, name: 'GV', get: p => p.GV, set: (p, v) => p.GV = v, step: 0.1 },
-                { flag: fitFlags.GW, name: 'GW', get: p => p.GW, set: (p, v) => p.GW = Math.max(0, v), step: 0.1 }, { flag: fitFlags.GP, name: 'GP', get: p => p.GP, set: (p, v) => p.GP = v, step: 0.1 },
-                { flag: fitFlags.LX, name: 'LX', get: p => p.LX, set: (p, v) => p.LX = Math.max(0, v), step: 0.2 },
-                { flag: fitFlags.LY, name: 'LY', get: p => p.LY, set: (p, v) => p.LY = Math.max(0, v), step: 0.2 },
-                { flag: fitFlags.eta, name: 'eta', get: p => p.eta, set: (p, v) => p.eta = Math.max(0, Math.min(1, v)), step: 0.05 },
-                { flag: fitFlags.shft, name: 'shft', get: p => p.shft, set: (p, v) => p.shft = v, step: 0.01 }, { flag: fitFlags.trns, name: 'trns', get: p => p.trns, set: (p, v) => p.trns = v, step: 0.01 },
+                { flag: fitFlags.zeroShift, name: 'zeroShift', get: p => p.zeroShift, set: (p, v) => p.zeroShift = v, step: 1e-3, saStep: 0.02, clamp: IDENT },
+                { flag: fitFlags.GU, name: 'GU', get: p => p.GU, set: (p, v) => p.GU = v, step: 0.1, saStep: 1.0, clamp: IDENT },
+                { flag: fitFlags.GV, name: 'GV', get: p => p.GV, set: (p, v) => p.GV = v, step: 0.1, saStep: 1.0, clamp: IDENT },
+                { flag: fitFlags.GW, name: 'GW', get: p => p.GW, set: (p, v) => p.GW = NONNEG(v), step: 0.1, saStep: 1.0, clamp: NONNEG },
+                { flag: fitFlags.GP, name: 'GP', get: p => p.GP, set: (p, v) => p.GP = v, step: 0.1, saStep: 1.0, clamp: IDENT },
+                { flag: fitFlags.LX, name: 'LX', get: p => p.LX, set: (p, v) => p.LX = NONNEG(v), step: 0.2, saStep: 1.0, clamp: NONNEG },
+                { flag: fitFlags.LY, name: 'LY', get: p => p.LY, set: (p, v) => p.LY = NONNEG(v), step: 0.2, saStep: 1.0, clamp: NONNEG },
+                { flag: fitFlags.eta, name: 'eta', get: p => p.eta, set: (p, v) => p.eta = UNIT(v), step: 0.05, saStep: 0.1, clamp: UNIT },
+                { flag: fitFlags.shft, name: 'shft', get: p => p.shft, set: (p, v) => p.shft = v, step: 0.01, saStep: 0.5, clamp: IDENT },
+                { flag: fitFlags.trns, name: 'trns', get: p => p.trns, set: (p, v) => p.trns = v, step: 0.01, saStep: 0.5, clamp: IDENT },
             ];
             sharedParamDefs.forEach(def => { if (def.flag) paramMapping.push(def); });
             return { paramMapping };
@@ -1539,6 +1869,10 @@ const parsePhilipsUdfFile = (text) => {
             const workingData = getWorkingData(true);
             if (workingData.tth.length === 0) return { params: initialParams };
             const maxTth = Math.max(...workingData.tth);
+            // Use the SAME Poisson weights as the LM path. Previously SA minimized an
+            // unweighted SSE, so switching algorithm silently changed the objective and
+            // therefore the answer.
+            const saWeights = getWorkingData(false).intensity.map(y => 1 / Math.max(y, 1));
 
             const objective = (p_vec, params_template) => {
                 let tempParams = JSON.parse(JSON.stringify(params_template));
@@ -1552,36 +1886,66 @@ const parsePhilipsUdfFile = (text) => {
                 leBailIntensityExtraction(workingData, combined, tempParams);
                 const yc = calculateNetPattern(workingData.tth, combined, tempParams);
                 const yo = workingData.intensity;
-                // Profile out the linear scale (intensities are renormalized to max=1000 by
-                // the Le Bail step, so an absolute-scale residual is dominated by an arbitrary
-                // overall offset). s = Σ(y_obs · y_calc) / Σ(y_calc²).
+                // Profile out the linear scale factor so the residual is insensitive to the
+                // arbitrary absolute level of the extracted intensities:
+                //   s = Σ(w · y_obs · y_calc) / Σ(w · y_calc²)
                 let num = 0, den = 0;
-                for (let i = 0; i < yo.length; i++) { num += yo[i] * yc[i]; den += yc[i] * yc[i]; }
+                for (let i = 0; i < yo.length; i++) { num += saWeights[i] * yo[i] * yc[i]; den += saWeights[i] * yc[i] * yc[i]; }
                 const s = den > 1e-30 ? num / den : 1.0;
-                let sse = 0;
-                for (let i = 0; i < yo.length; i++) { const r = yo[i] - s * yc[i]; sse += r * r; }
-                return sse;
+                let wsse = 0;
+                for (let i = 0; i < yo.length; i++) { const r = yo[i] - s * yc[i]; wsse += saWeights[i] * r * r; }
+                return wsse;
             };
 
-            let T = 1.0, coolingRate = 0.99, maxSteps = maxIter;
+            const maxSteps = Math.max(1, maxIter);
             let current_x = paramMapping.map(m => m.get(initialParams));
             let current_cost = objective(current_x, initialParams);
             let best_x = [...current_x], best_cost = current_cost;
 
+            // --- Temperature must be calibrated to the SCALE OF THE COST FUNCTION ---
+            // The cost is a weighted sum of squares over every data point, so for a real pattern
+            // it is of order 1e7-1e8 and a typical uphill move costs ~1e5. With the old fixed
+            // T = 1, exp(-1e5/1) underflows to exactly 0, so no uphill move was EVER accepted
+            // and "simulated annealing" silently degenerated into a greedy hill-climber that
+            // could not escape anything. Probe the local landscape and set T0 so that a typical
+            // uphill move is accepted with probability ~0.5 at the start.
+            let probeSum = 0, probeCount = 0;
+            for (let t = 0; t < 12; t++) {
+                const idx = Math.floor(Math.random() * paramMapping.length);
+                const probe = [...current_x];
+                probe[idx] = paramMapping[idx].clamp(probe[idx] + (Math.random() - 0.5) * 2 * paramMapping[idx].saStep);
+                const d = objective(probe, initialParams) - current_cost;
+                if (isFinite(d) && d > 0) { probeSum += d; probeCount++; }
+            }
+            const typicalUphill = probeCount > 0 ? probeSum / probeCount : Math.max(1e-12, Math.abs(current_cost) * 1e-6);
+            const T0 = Math.max(1e-30, typicalUphill / Math.LN2);
+            // Geometric schedule that reaches T0/1e4 exactly at the last step, whatever maxIter is.
+            const coolingRate = Math.pow(1e-4, 1 / maxSteps);
+            let T = T0;
+
+            let accepted = 0;
             for (let i = 0; i < maxSteps; i++) {
-                let neighbor_x = current_x.map((val, idx) => {
-                    let newVal = val + (Math.random() - 0.5) * paramMapping[idx].step * 2 * T;
-                    if (paramMapping[idx].name.includes('eta')) newVal = Math.max(0, Math.min(1, newVal));
-                    else if (['a1','a2','b1','b2','c1','c2','a_shared','b_shared','c_shared', 'GW', 'LX', 'LY'].includes(paramMapping[idx].name)) newVal = Math.max(0.001, newVal);
-                    return newVal;
-                });
-                let neighbor_cost = objective(neighbor_x, initialParams);
-                if (neighbor_cost < current_cost || Math.exp(-(neighbor_cost - current_cost) / T) > Math.random()) {
-                    current_x = [...neighbor_x]; current_cost = neighbor_cost;
+                // Perturb ONE parameter per step. Moving all of them at once means a proposal is
+                // accepted only if a simultaneous random change in every dimension happens to
+                // help, which becomes vanishingly unlikely as the parameter count grows.
+                const idx = Math.floor(Math.random() * paramMapping.length);
+                const m = paramMapping[idx];
+                // Move amplitude shrinks with the schedule but never to zero, so the walk keeps
+                // exploring locally right to the end.
+                const amp = 0.1 + 0.9 * (T / T0);
+                const neighbor_x = [...current_x];
+                neighbor_x[idx] = m.clamp(current_x[idx] + (Math.random() - 0.5) * 2 * m.saStep * amp);
+
+                const neighbor_cost = objective(neighbor_x, initialParams);
+                const dCost = neighbor_cost - current_cost;
+                if (dCost < 0 || Math.exp(-dCost / T) > Math.random()) {
+                    current_x = neighbor_x; current_cost = neighbor_cost; accepted++;
                 }
                 if (current_cost < best_cost) { best_x = [...current_x]; best_cost = current_cost; }
                 T *= coolingRate;
-                if (progressCallback && i % Math.floor(maxSteps/100) === 0) {
+
+                const progressEvery = Math.max(1, Math.floor(maxSteps / 100));   // never 0 -> i % 0 is NaN
+                if (progressCallback && i % progressEvery === 0) {
                     await progressCallback(i / maxSteps, null);
                 }
             }
@@ -1589,7 +1953,8 @@ const parsePhilipsUdfFile = (text) => {
 
             let finalParams = JSON.parse(JSON.stringify(initialParams));
             paramMapping.forEach((m, i) => m.set(finalParams, best_x[i]));
-            return { params: finalParams, algorithm: 'sa', paramMapping, fitFlags, constraints };
+            return { params: finalParams, algorithm: 'sa', paramMapping, fitFlags, constraints,
+                     saAcceptance: accepted / maxSteps, saInitialCost: best_cost };
         }
         
 
@@ -1616,14 +1981,17 @@ const parsePhilipsUdfFile = (text) => {
             };
 
             // Weighted residuals with the optimal linear scale factor profiled out.
-            // Le Bail extraction renormalizes intensities to max=1000, so y_calc_net is on
-            // an arbitrary absolute scale. Computing s = Σ(w·y_obs·y_calc) / Σ(w·y_calc²)
+            // The extracted intensities carry an arbitrary overall scale, so computing
+            // s = Σ(w·y_obs·y_calc) / Σ(w·y_calc²)
             // and using r_i = √w_i (y_obs_i - s·y_calc_i) removes that nuisance dimension,
             // making the remaining Jacobian directions linearly independent.
             const weightedResidualsAndScale = (p_vec, base_params, hklFrozen) => {
                 let tempParams = JSON.parse(JSON.stringify(base_params));
                 paramMapping.forEach((m, i) => m.set(tempParams, p_vec[i]));
-                const yc = calculateNetPattern(workingData.tth, hklFrozen, tempParams);
+                // Intensities stay frozen, but positions must follow the trial cell -- otherwise
+                // the lattice parameters have no effect on the residual whatsoever.
+                const hklMoved = refreshReflectionPositions(hklFrozen, tempParams);
+                const yc = calculateNetPattern(workingData.tth, hklMoved, tempParams);
                 const yo = workingData.intensity;
                 let num = 0, den = 0;
                 for (let i = 0; i < N; i++) { num += weights[i] * yo[i] * yc[i]; den += weights[i] * yc[i] * yc[i]; }
@@ -1643,7 +2011,12 @@ const parsePhilipsUdfFile = (text) => {
                 const { wr: weightedResiduals } = weightedResidualsAndScale(p_current_vec, params, hklFrozen);
                 const cost = dot(weightedResiduals, weightedResiduals);
 
-                if (Math.abs(last_cost - cost) < 1e-9 * cost && iter > 0) break;
+                // Because Le Bail extraction drives the calculated pattern toward y_obs at the
+                // CURRENT parameters, the base-point cost sits near the noise floor and the
+                // relative change between iterations is tiny even while parameters are still
+                // moving. A 1e-9 relative tolerance after a single iteration therefore stopped
+                // the refinement prematurely; require a few iterations and a looser tolerance.
+                if (iter > 3 && Math.abs(last_cost - cost) < 1e-7 * Math.max(cost, 1e-12)) break;
                 last_cost = cost;
 
                 // Forward-difference Jacobian. Intensities are frozen across the columns,
@@ -1663,6 +2036,9 @@ const parsePhilipsUdfFile = (text) => {
                 const p_step = solve(A_lm, Jtr);
                 if (p_step.some(isNaN)) break;
 
+                // No trust region and no parameter bounds: the step is accepted only if it
+                // actually lowers the cost, and the Marquardt lambda already damps the step
+                // when the normal matrix is ill-conditioned.
                 const p_new_vec = add(p_current_vec, p_step);
                 const { wr: new_wr } = weightedResidualsAndScale(p_new_vec, params, hklFrozen);
                 const new_cost = dot(new_wr, new_wr);
@@ -2076,6 +2452,17 @@ const parsePhilipsUdfFile = (text) => {
                 addLine(`Rp (%):      ${fitResults.stats.r_p.toFixed(4)}`);
                 addLine(`Rwp (%):     ${fitResults.stats.rwp.toFixed(4)}`);
                 addLine(`Reduced Chi^2: ${fitResults.stats.chi2.toFixed(4)}    (GoF = sqrt(Chi^2_r) = ${Math.sqrt(Math.max(0, fitResults.stats.chi2)).toFixed(4)})`);
+                addLine(`Profile function: ${fitResults.profileMode === 'empirical' ? 'Empirical pseudo-Voigt (free eta)' : 'Thompson-Cox-Hastings pseudo-Voigt'}`);
+                if (fitResults.cellWarning) {
+                    doc.setTextColor(200, 0, 0);
+                    doc.splitTextToSize(fitResults.cellWarning, pdfWidth - 2 * margin).forEach(l => addLine(l));
+                    doc.setTextColor(0, 0, 0);
+                }
+                if (fitResults.widthWarning) {
+                    doc.setTextColor(200, 0, 0);
+                    doc.splitTextToSize(fitResults.widthWarning, pdfWidth - 2 * margin).forEach(l => addLine(l));
+                    doc.setTextColor(0, 0, 0);
+                }
                 
                 doc.addPage();
                 yPos = 20;
@@ -2090,15 +2477,25 @@ const parsePhilipsUdfFile = (text) => {
                     const P = fitResults.paramMapping.length;
                     if (N > P && fitResults.ss_res !== undefined) {
                         const reduced_chi_sq = fitResults.ss_res / (N - P);
-                        const cov_matrix = covarianceFromJtJ(fitResults.JtJ);
+                        const covResult = covarianceFromJtJ(fitResults.JtJ, fitResults.paramMapping.map(p => p.name));
+                        const cov_matrix = covResult ? covResult.cov : null;
                         if (cov_matrix) {
                             fitResults.paramMapping.forEach((p, i) => {
-                                if (cov_matrix[i] && cov_matrix[i][i] !== undefined) {
-                                    esds[p.name] = Math.sqrt(Math.abs(reduced_chi_sq * cov_matrix[i][i]));
-                                }
+                                const v = cov_matrix[i] && cov_matrix[i][i];
+                                if (isFinite(v)) esds[p.name] = Math.sqrt(Math.abs(reduced_chi_sq * v));
                             });
-                        } else {
-                            esdWarning = "ESD calculation failed: matrix is singular (correlated parameters).";
+                        }
+                        if (covResult && covResult.dropped.length) {
+                            esdWarning = "No ESD could be determined for: "
+                                + covResult.dropped.map(d => `${d.name} (${d.reason})`).join(', ')
+                                + ". Other parameters are unaffected.";
+                        } else if (!cov_matrix) {
+                            esdWarning = "ESD calculation failed: the normal matrix could not be inverted.";
+                        }
+                        if (!esdWarning) {
+                            esdWarning = "Note: ESDs are lower bounds. They are derived from the profile-parameter"
+                                + " Jacobian only and do not account for the Le Bail intensity degrees of freedom or"
+                                + " the profiled-out scale factor, both of which absorb part of the residual.";
                         }
                     }
                 }
@@ -2195,6 +2592,17 @@ const parsePhilipsUdfFile = (text) => {
             rescalePlot();
         });
         
+        function syncProfileModeUI() {
+            const tch = getProfileMode() === 'tch';
+            // In TCH mode eta is a derived quantity, not a free parameter.
+            controls.paramEta.disabled = tch;
+            controls.fitEta.disabled = tch;
+            if (tch) controls.fitEta.checked = false;
+        }
+        if (controls.profileMode) {
+            controls.profileMode.addEventListener('change', () => { syncProfileModeUI(); updatePreviewPattern(); });
+        }
+
         controls.bravaisLatticeP1.addEventListener('change', () => { updateLatticeParamUI(1); updateAvailableConstraints(); updatePreviewPattern(); });
         controls.bravaisLatticeP2.addEventListener('change', () => { updateLatticeParamUI(2); updateAvailableConstraints(); updatePreviewPattern(); });
         controls.constraintsContainer.addEventListener('change', (e) => { if(e.target.classList.contains('constraint-checkbox')) { updateConstraintStates(); updatePreviewPattern(); } });
@@ -2218,6 +2626,7 @@ const parsePhilipsUdfFile = (text) => {
         });
 
         // --- Initial Setup ---
+        syncProfileModeUI();
         updateLatticeParamUI(1);
         updateLatticeParamUI(2);
         updateConstraintsUI();
