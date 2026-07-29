@@ -413,8 +413,8 @@
                      <div class="slider-group">
                          <label class="control-label">Max Iterations</label>
                          <div class="slider-value-track">
-                            <input type="range" id="iterations-slider" min="2" max="200" value="120" step="1" class="custom-slider">
-                            <span id="iterations-value" class="slider-value-display">120</span>
+                            <input type="range" id="iterations-slider" min="2" max="500" value="200" step="1" class="custom-slider">
+                            <span id="iterations-value" class="slider-value-display">200</span>
                          </div>
                      </div>
 
@@ -1131,8 +1131,19 @@ const parsePhilipsUdfFile = (text) => {
             reportLines.push(`Rwp (%):     ${stats.rwp.toFixed(4)}`);
             reportLines.push(`Reduced χ²: ${stats.chi2.toFixed(4)}    (GoF = √χ²ᵣ = ${Math.sqrt(Math.max(0, stats.chi2)).toFixed(4)})`);
             reportLines.push(`Algorithm:   ${algorithm === 'lm' ? 'Levenberg-Marquardt' : 'Simulated Annealing'}`);
+            if (algorithm === 'lm' && fitResults.iterationsUsed !== undefined) {
+                reportLines.push(`Convergence: ${fitResults.converged ? 'reached' : 'NOT reached (hit iteration limit)'}`
+                    + ` after ${fitResults.iterationsUsed} iteration(s)`);
+            }
+            if (fitResults.leBailCycles !== undefined) {
+                const lbState = fitResults.leBailSettled
+                    ? `settled in ${fitResults.leBailCycles} cycle(s)`
+                    : `NOT settled (stopped at the ${fitResults.leBailCycles}-cycle budget)`;
+                reportLines.push(`Le Bail partition: ${lbState}`);
+            }
             if (fitResults.cellWarning) { reportLines.push('!!! ' + fitResults.cellWarning); }
             if (fitResults.widthWarning) { reportLines.push('!!! ' + fitResults.widthWarning); }
+            if (fitResults.convergenceWarning) { reportLines.push('!!! ' + fitResults.convergenceWarning); }
             if (esdWarning) reportLines.push(esdWarning);
             reportLines.push('');
 
@@ -1362,6 +1373,58 @@ const parsePhilipsUdfFile = (text) => {
         //   FWHM_L [deg] = 2 * HWHM_L / 100
         const SQRT_8LN2 = Math.sqrt(8 * Math.log(2));
 
+        // Smallest Gaussian variance the profile is allowed to take, in centidegrees^2.
+        // This is NOT a cosmetic floor. sigma^2 is a variance and cannot be negative, but the
+        // old code merely clamped it with Math.max(1e-9, sigma_sq) and carried on -- which
+        // created a trap the refinement could not escape. Once
+        //     GU*tan^2(th) + GV*tan(th) + GW + GP/cos^2(th)
+        // went non-positive across the whole fitted range, the clamp made the calculated
+        // pattern COMPLETELY independent of GU, GV, GW and GP: all four Jacobian columns became
+        // identically zero (verified: max|dy| = 0.000e+0 for a finite-difference step, against
+        // ~4-36 at physical values), so there was no gradient left to climb back out. The
+        // refinement settled there, reported "converged", and returned a profile that had
+        // silently degenerated to pure Lorentzian at a cost several times worse than the true
+        // minimum. The refiners below now keep sigma^2 strictly positive instead of relying on
+        // the clamp to paper over the degeneracy.
+        // 1e-3 cd^2 corresponds to FWHM_G ~ 7.4e-4 deg: far below any real instrumental width,
+        // but large enough that the profile stays differentiable in GU/GV/GW/GP.
+        const MIN_SIGMA_SQ_CD = 1e-3;
+
+        function gaussianVarianceAt(tth, params) {
+            const thetaRad = Math.min(tth * (Math.PI / 180) / 2, 89.999 * Math.PI / 180);
+            const tanTheta = Math.tan(thetaRad);
+            const cosTheta = Math.cos(thetaRad);
+            return params.GU*tanTheta*tanTheta + params.GV*tanTheta + params.GW + params.GP/(cosTheta*cosTheta);
+        }
+
+        // Minimum of sigma^2 over the fitted range. Sampling rather than solving for the turning
+        // point: it is cheap, and it stays correct whichever of the four terms is active.
+        function minGaussianVariance(params, tthMin, tthMax, samples = 96) {
+            let m = Infinity;
+            for (let i = 0; i <= samples; i++) {
+                const v = gaussianVarianceAt(tthMin + (tthMax - tthMin) * (i / samples), params);
+                if (isFinite(v) && v < m) m = v;
+            }
+            return m;
+        }
+
+        function gaussianVarianceIsPositive(params, tthMin, tthMax) {
+            return minGaussianVariance(params, tthMin, tthMax) >= MIN_SIGMA_SQ_CD;
+        }
+
+        // Repairs a STARTING point that is already unphysical -- otherwise the refinement begins
+        // with four dead parameters and can never recover them. GW is the constant term of the
+        // variance polynomial, so raising it lifts sigma^2 uniformly across the pattern and is
+        // the minimal, least-surprising correction. Returns the amount added (0 if nothing was
+        // wrong) so the caller can tell the user their input was altered.
+        function repairGaussianVariance(params, tthMin, tthMax) {
+            const m = minGaussianVariance(params, tthMin, tthMax);
+            if (!(m < MIN_SIGMA_SQ_CD)) return 0;
+            const bump = MIN_SIGMA_SQ_CD - m;
+            params.GW += bump;
+            return bump;
+        }
+
         function calculateProfileWidths(tth, params) {
             const thetaRad = Math.min(tth * (Math.PI / 180) / 2, 89.999 * Math.PI / 180);
             const tanTheta = Math.tan(thetaRad);
@@ -1370,7 +1433,7 @@ const parsePhilipsUdfFile = (text) => {
             // Gaussian variance in centidegrees^2
             const sigma_sq_cd = params.GU*tanTheta*tanTheta + params.GV*tanTheta + params.GW + params.GP/(cosTheta*cosTheta);
             if (!(sigma_sq_cd > 0)) profileWidthWarnings++;   // unphysical: flag rather than silently floor
-            const sigma_cd = Math.sqrt(Math.max(1e-9, sigma_sq_cd));   // sigma in centidegrees
+            const sigma_cd = Math.sqrt(Math.max(MIN_SIGMA_SQ_CD, sigma_sq_cd));   // sigma in centidegrees
             const fwhm_G_deg = sigma_cd * SQRT_8LN2 / 100.0;            // FWHM_G in degrees
 
             // Lorentzian HWHM in centidegrees -> FWHM in degrees
@@ -1523,12 +1586,50 @@ const parsePhilipsUdfFile = (text) => {
         // by width only -- 50/50 for equal widths -- and can never recover the true intensity
         // ratio, no matter how good the lattice parameters are.
         // ---------------------------------------------------------------------------
-        // Number of partition iterations. The omega values are cached, so extra cycles cost only
-        // a couple of cheap passes -- and heavily overlapped reflections need well over 5 to
-        // converge (a 0.3-FWHM-separated 3:1 doublet reaches ratio 1.6 at 5 cycles, 2.9 at 20).
-        const LEBAIL_CYCLES = 20;
+        // Iterate the partition to a TOLERANCE rather than a fixed count. A fixed 20 cycles was
+        // simultaneously wasteful and inadequate: on a normally-resolved pattern the intensities
+        // are already stable to ~1e-8 by cycle 10, while a tightly overlapped pair is nowhere
+        // near settled at 20 -- a 0.3-FWHM-separated 3:1 doublet extracts as 2.09:1 after 20
+        // cycles and needs roughly 300 to reach the true 3.00:1. (The figures quoted in the old
+        // comment here, 1.6 at 5 cycles and 2.9 at 20, were about a factor of two optimistic in
+        // cycle count; those values actually arrive at 10 and ~90.) The adaptive loop is
+        // self-balancing: patterns with many reflections are expensive per cycle but converge
+        // quickly because neighbouring peaks anchor each other, while the slow cases are
+        // isolated close doublets, which are cheap per cycle.
+        // The cap has to be budgeted, not fixed. Cost per cycle scales with the reflection
+        // count, so an unconditional 500 is ruinous on a dense pattern: two large tetragonal
+        // cells (1763 reflections) took 795 ms per extraction, and since an extraction runs once
+        // per LM iteration that is ~160 s for a 200-iteration refinement -- a frozen browser.
+        // Budgeting (cycles x reflections) keeps every extraction to roughly 20 ms regardless of
+        // pattern density. This also lands the effort where it is actually recoverable: a sparse
+        // pattern gets hundreds of cycles and its overlaps genuinely resolve, whereas in a dense
+        // pattern whose reflections are spaced more closely than their own width the individual
+        // intensities are not separable at any cycle count -- only their sum is determined, and
+        // that settles within a few cycles. Whenever the budget truncates the iteration the
+        // caller is told, so a user who wants the extra precision knows it was not reached.
+        const LEBAIL_MAX_CYCLES = 500;
+        const LEBAIL_MIN_CYCLES = 25;
+        const LEBAIL_CYCLE_BUDGET = 20000;   // cycles x reflections, per extraction
+        const LEBAIL_TOL = 1e-6;
 
-        function leBailIntensityExtraction(exp_net, hklList, params, cycles = LEBAIL_CYCLES) {
+        // A starved reflection is held at this fraction of the strongest intensity instead of at
+        // exactly zero. The update is multiplicative (I_k_new is proportional to I_k_old), so a
+        // reflection pinned at exactly 0 can never grow again -- and the `if (!(Ik > 0)) continue`
+        // guards below then skip it on every subsequent cycle. That made zero an ABSORBING STATE:
+        // over-subtracting the background by as little as 20 counts permanently deleted weak
+        // reflections from the model, and because calculateNetPattern also skips zero-intensity
+        // peaks they disappeared from the calculated pattern altogether. The floor is far too
+        // small to show up in the profile but is strictly positive, so a momentarily starved
+        // reflection really can recover on a later cycle -- which is what the old comment
+        // claimed was happening while nothing in the code implemented it.
+        const LEBAIL_FLOOR_FRAC = 1e-9;
+
+        // Cycles consumed by the most recent extraction, so the caller can tell whether the
+        // partition actually converged or ran into the cap.
+        let lastLeBailCycles = 0;
+        let lastLeBailSettled = true;
+
+        function leBailIntensityExtraction(exp_net, hklList, params, cycleOverride = null) {
             const M = hklList.length;
             if (M === 0) return;
             const tth = exp_net.tth;
@@ -1538,6 +1639,16 @@ const parsePhilipsUdfFile = (text) => {
             const contexts = buildPeakContexts(tth, hklList, params).filter(Boolean);
             if (contexts.length === 0) { hklList.forEach(p => p.intensity = 0); return; }
 
+            // Channel width. The partition below accumulates SUMS over data points, so its
+            // natural output is the channel sum Sum(y_i), not the integrated intensity
+            // Integral(y d2theta) = step * Sum(y_i). Rescaling by `step` at the end is what puts
+            // the extracted intensities on the same scale as the data, so that Sum_k I_k*Omega_k
+            // reproduces y_obs directly and the linear scale factor computed downstream really
+            // does converge to ~1. Without it the intensities came out a factor 1/step too large
+            // -- a factor of 50 for a 0.02 deg step -- and the reported scale factor silently
+            // tracked the step size instead of approaching unity.
+            const step = N > 1 ? (tth[N - 1] - tth[0]) / (N - 1) : 1;
+
             // Cache Omega_k(i) once; the iteration below only reweights it.
             for (const c of contexts) {
                 const len = c.i1 - c.i0 + 1;
@@ -1546,20 +1657,34 @@ const parsePhilipsUdfFile = (text) => {
                 c.omega = arr;
             }
 
-            // Le Bail's standard start: all intensities equal. Any previously extracted,
-            // strictly positive intensities are reused as a better starting point.
+            // Reflections with no evaluation window (outside the data range, or zero width) take
+            // no part in the partition, so they must stay at zero rather than being lifted to the
+            // recovery floor.
+            const isActive = new Uint8Array(M);
+            for (const c of contexts) isActive[c.peakIdx] = 1;
+
+            const maxCycles = cycleOverride !== null ? cycleOverride : Math.max(
+                LEBAIL_MIN_CYCLES,
+                Math.min(LEBAIL_MAX_CYCLES, Math.round(LEBAIL_CYCLE_BUDGET / Math.max(1, contexts.length))));
+
+            // Le Bail's standard start: all intensities equal. Any previously extracted, strictly
+            // positive intensities are reused as a better starting point. (The update is
+            // invariant under an overall rescaling of I, so it is harmless that those values are
+            // on the integrated scale while the iteration itself works in channel sums.)
             const I = new Float64Array(M);
             let anyPositive = false;
             for (let k = 0; k < M; k++) {
                 const v = hklList[k].intensity;
                 if (Number.isFinite(v) && v > 0) { I[k] = v; anyPositive = true; }
             }
-            if (!anyPositive) I.fill(1);
+            if (!anyPositive) { for (let k = 0; k < M; k++) I[k] = isActive[k] ? 1 : 0; }
 
             const sumCalc = new Float64Array(N);
             const Inew = new Float64Array(M);
+            let cyclesUsed = 0;
 
-            for (let cyc = 0; cyc < cycles; cyc++) {
+            for (let cyc = 0; cyc < maxCycles; cyc++) {
+                cyclesUsed = cyc + 1;
                 sumCalc.fill(0);
                 for (const c of contexts) {
                     const Ik = I[c.peakIdx];
@@ -1579,15 +1704,28 @@ const parsePhilipsUdfFile = (text) => {
                     Inew[c.peakIdx] = acc;
                 }
 
-                // Background-subtracted data can dip negative; a negative structure factor is
-                // meaningless, so clamp at zero but keep a floor so a reflection that is
-                // momentarily starved can recover on a later cycle.
-                for (let k = 0; k < M; k++) I[k] = Inew[k] > 0 ? Inew[k] : 0;
+                // Background-subtracted data can dip negative and a negative structure factor is
+                // meaningless, so clamp -- but to a strictly positive floor rather than to zero,
+                // so the reflection can climb back if a later cycle gives it room.
+                let maxNew = 0;
+                for (let k = 0; k < M; k++) if (Inew[k] > maxNew) maxNew = Inew[k];
+                const floor = maxNew * LEBAIL_FLOOR_FRAC;
+
+                let maxChange = 0;
+                for (let k = 0; k < M; k++) {
+                    const v = isActive[k] ? Math.max(Inew[k], floor) : 0;
+                    const delta = Math.abs(v - I[k]);
+                    if (delta > maxChange) maxChange = delta;
+                    I[k] = v;
+                }
+
+                // Stop when the partition has actually settled, not after an arbitrary count.
+                if (maxNew > 0 && maxChange < LEBAIL_TOL * maxNew) break;
             }
 
-            for (let k = 0; k < M; k++) hklList[k].intensity = I[k];
-            // No overall renormalization: intensities stay on the natural data scale, so the
-            // optimal linear scale factor computed downstream converges to ~1.
+            lastLeBailCycles = cyclesUsed;
+            lastLeBailSettled = cyclesUsed < maxCycles;
+            for (let k = 0; k < M; k++) hklList[k].intensity = I[k] * step;
         }
 
         function calculateStatistics(totalWorkingData, netCalcPattern, backgroundSlice, fitFlags) {
@@ -1723,6 +1861,8 @@ const parsePhilipsUdfFile = (text) => {
             
             resetProfileWarnings();
             leBailIntensityExtraction(workingData, combinedHklList, finalParams);
+            const leBailCycles = lastLeBailCycles;
+            const leBailSettled = lastLeBailSettled;
             
             const finalWorkingPattern_NET = calculateNetPattern(workingData.tth, combinedHklList, finalParams);
             
@@ -1735,6 +1875,46 @@ const parsePhilipsUdfFile = (text) => {
             const finalStats = calculateStatistics(finalWorkingData_TOTAL, finalWorkingPattern_NET, background_slice, fitFlags);
             fitResults.stats = finalStats;
             fitResults.profileMode = getProfileMode();
+            fitResults.leBailCycles = leBailCycles;
+            fitResults.leBailSettled = leBailSettled;
+
+            // Did the refinement actually reach a minimum, and is that minimum believable?
+            // Levenberg-Marquardt converges only when the starting cell is within roughly a
+            // tenth of a peak width; beyond that the zero shift absorbs the mismatch and it
+            // settles on a wrong cell that it STILL reports as converged (on clean two-phase
+            // data a 0.014 A starting error lands at Rwp = 70% instead of 0.12%). That is a
+            // property of the algorithm, not a bug that can be fixed inside it -- so say so.
+            const convergenceNotes = [];
+            if (fitResults.algorithm === 'lm') {
+                if (fitResults.converged === false) {
+                    convergenceNotes.push(`The refinement used all ${maxIterations} iterations without meeting the convergence `
+                        + `test, so these parameters are not a converged minimum. Raise the iteration limit and run again.`);
+                }
+                if (finalStats.rwp > 25) {
+                    convergenceNotes.push(`Rwp = ${finalStats.rwp.toFixed(1)}% is far too high for a Le Bail fit. Levenberg-Marquardt `
+                        + `converges only from a starting cell within about a tenth of a peak width, so this is most likely a runaway `
+                        + `rather than a true minimum -- check the zero shift. Run Simulated Annealing first, then polish with LM.`);
+                }
+            }
+            if (fitResults.varianceRepair > 0) {
+                convergenceNotes.push(`The starting Gaussian variance was non-positive somewhere in the fitted range, which leaves `
+                    + `GU/GV/GW/GP with no gradient at all. GW was raised by ${fitResults.varianceRepair.toFixed(4)} to restore a `
+                    + `physical profile before refining.`);
+            }
+            if (!leBailSettled) {
+                convergenceNotes.push(`The Le Bail intensity partition was still changing when it hit its ${leBailCycles}-cycle `
+                    + `budget, meaning some reflections overlap too closely to be separated. Their individual extracted `
+                    + `intensities should not be relied on; the summed profile, and hence the cell parameters, usually still are.`);
+            }
+            if (fitResults.varianceBlocked > 0) {
+                convergenceNotes.push(`${fitResults.varianceBlocked} trial step(s) were rejected for driving the Gaussian variance `
+                    + `non-positive. The refinement finished against that physical boundary, so GU/GV/GW/GP are constrained rather `
+                    + `than freely determined and their ESDs should be read in that light.`);
+            }
+            if (convergenceNotes.length) {
+                fitResults.convergenceWarning = convergenceNotes.join(' ');
+                console.warn(fitResults.convergenceWarning);
+            }
 
             // A phase that generates (almost) no reflections in the fitted range contributes
             // nothing to the residual. Its parameters then have dead Jacobian columns, the ESDs
@@ -1869,6 +2049,13 @@ const parsePhilipsUdfFile = (text) => {
             const workingData = getWorkingData(true);
             if (workingData.tth.length === 0) return { params: initialParams };
             const maxTth = Math.max(...workingData.tth);
+            const minTthSA = Math.min(...workingData.tth);
+            // Same guard as the LM path: where the Gaussian variance is non-positive the profile
+            // is clamped and the pattern becomes completely insensitive to GU/GV/GW/GP, so the
+            // walk could wander into that region and never feel its way out. Repair the start,
+            // then make any move that re-enters it infinitely expensive.
+            const saParams = JSON.parse(JSON.stringify(initialParams));
+            const varianceRepair = repairGaussianVariance(saParams, minTthSA, maxTth);
             // Use the SAME Poisson weights as the LM path. Previously SA minimized an
             // unweighted SSE, so switching algorithm silently changed the objective and
             // therefore the answer.
@@ -1878,6 +2065,7 @@ const parsePhilipsUdfFile = (text) => {
                 let tempParams = JSON.parse(JSON.stringify(params_template));
                 paramMapping.forEach((m, i) => m.set(tempParams, p_vec[i]));
                 if (tempParams.phase1.a <= 0 || (tempParams.phase2.a && tempParams.phase2.a <= 0)) return 1e12;
+                if (!gaussianVarianceIsPositive(tempParams, minTthSA, maxTth)) return 1e12;
 
                 let hkl1 = generateHKL(maxTth, tempParams.phase1, tempParams.phase1.system, tempParams.phase1.centering, 'P1');
                 let hkl2 = generateHKL(maxTth, tempParams.phase2, tempParams.phase2.system, tempParams.phase2.centering, 'P2');
@@ -1898,8 +2086,8 @@ const parsePhilipsUdfFile = (text) => {
             };
 
             const maxSteps = Math.max(1, maxIter);
-            let current_x = paramMapping.map(m => m.get(initialParams));
-            let current_cost = objective(current_x, initialParams);
+            let current_x = paramMapping.map(m => m.get(saParams));
+            let current_cost = objective(current_x, saParams);
             let best_x = [...current_x], best_cost = current_cost;
 
             // --- Temperature must be calibrated to the SCALE OF THE COST FUNCTION ---
@@ -1914,7 +2102,7 @@ const parsePhilipsUdfFile = (text) => {
                 const idx = Math.floor(Math.random() * paramMapping.length);
                 const probe = [...current_x];
                 probe[idx] = paramMapping[idx].clamp(probe[idx] + (Math.random() - 0.5) * 2 * paramMapping[idx].saStep);
-                const d = objective(probe, initialParams) - current_cost;
+                const d = objective(probe, saParams) - current_cost;
                 if (isFinite(d) && d > 0) { probeSum += d; probeCount++; }
             }
             const typicalUphill = probeCount > 0 ? probeSum / probeCount : Math.max(1e-12, Math.abs(current_cost) * 1e-6);
@@ -1936,7 +2124,7 @@ const parsePhilipsUdfFile = (text) => {
                 const neighbor_x = [...current_x];
                 neighbor_x[idx] = m.clamp(current_x[idx] + (Math.random() - 0.5) * 2 * m.saStep * amp);
 
-                const neighbor_cost = objective(neighbor_x, initialParams);
+                const neighbor_cost = objective(neighbor_x, saParams);
                 const dCost = neighbor_cost - current_cost;
                 if (dCost < 0 || Math.exp(-dCost / T) > Math.random()) {
                     current_x = neighbor_x; current_cost = neighbor_cost; accepted++;
@@ -1951,16 +2139,16 @@ const parsePhilipsUdfFile = (text) => {
             }
             if(progressCallback) await progressCallback(1, null);
 
-            let finalParams = JSON.parse(JSON.stringify(initialParams));
+            let finalParams = JSON.parse(JSON.stringify(saParams));
             paramMapping.forEach((m, i) => m.set(finalParams, best_x[i]));
             return { params: finalParams, algorithm: 'sa', paramMapping, fitFlags, constraints,
-                     saAcceptance: accepted / maxSteps, saInitialCost: best_cost };
+                     saAcceptance: accepted / maxSteps, saInitialCost: best_cost, varianceRepair };
         }
         
 
         async function refineParametersLM(initialParams, fitFlags, constraints, maxIter, progressCallback, workingData, total_intensity_for_weights) {
             const { paramMapping } = getParameterMapping(fitFlags, constraints);
-            if (paramMapping.length === 0) return { params: initialParams, algorithm: 'lm', paramMapping, fitFlags, constraints };
+            if (paramMapping.length === 0) return { params: initialParams, algorithm: 'lm', paramMapping, fitFlags, constraints, converged: true, iterationsUsed: 0 };
 
             let params = JSON.parse(JSON.stringify(initialParams));
             let lambda = 0.001;
@@ -1970,6 +2158,12 @@ const parsePhilipsUdfFile = (text) => {
             const N = workingData.intensity.length;
 
             const maxTth = Math.max(...workingData.tth);
+            const minTth = Math.min(...workingData.tth);
+
+            // A starting point whose Gaussian variance is already non-positive has no gradient in
+            // GU/GV/GW/GP at all, so the refinement could never leave it. Lift it back into the
+            // physical region before the first iteration and tell the caller we did.
+            const varianceRepair = repairGaussianVariance(params, minTth, maxTth);
 
             // Build hkl list and freeze intensities at the CURRENT parameters.
             const buildFrozenHkl = (current_params) => {
@@ -1982,7 +2176,7 @@ const parsePhilipsUdfFile = (text) => {
 
             // Weighted residuals with the optimal linear scale factor profiled out.
             // The extracted intensities carry an arbitrary overall scale, so computing
-            // s = Σ(w·y_obs·y_calc) / Σ(w·y_calc²)
+            //   s = Σ(w·y_obs·y_calc) / Σ(w·y_calc²)
             // and using r_i = √w_i (y_obs_i - s·y_calc_i) removes that nuisance dimension,
             // making the remaining Jacobian directions linearly independent.
             const weightedResidualsAndScale = (p_vec, base_params, hklFrozen) => {
@@ -2001,9 +2195,64 @@ const parsePhilipsUdfFile = (text) => {
                 return { wr, s };
             };
 
-            let last_cost = Infinity, JtJ;
+            // A trial vector is admissible only if it keeps sigma^2 positive across the fitted
+            // range. Rejecting such steps is what stops the refinement walking into the dead
+            // region described at MIN_SIGMA_SQ_CD; because every forward-difference probe
+            // INCREASES sigma^2, an admissible base point always yields an admissible Jacobian.
+            const trialIsPhysical = (p_vec) => {
+                const t = JSON.parse(JSON.stringify(params));
+                paramMapping.forEach((m, i) => m.set(t, p_vec[i]));
+                return gaussianVarianceIsPositive(t, minTth, maxTth);
+            };
+
+            // Only these four enter sigma^2, so they are the only ones the constraint can pin.
+            const VARIANCE_PARAMS = new Set(['GU', 'GV', 'GW', 'GP']);
+            const varianceIdx = paramMapping
+                .map((m, i) => (VARIANCE_PARAMS.has(m.name) ? i : -1))
+                .filter(i => i >= 0);
+
+            // Turn a proposed step into a feasible one.
+            //
+            // Simply REJECTING an infeasible step is not enough, and getting this wrong is worse
+            // than not constraining at all: once the constraint goes active, the Gauss-Newton
+            // direction points out of the feasible region, every trial fails at every lambda, and
+            // the refinement concludes "no downhill step exists" -- abandoning the LATTICE
+            // parameters too, while they are still far from converged. (Measured: rejection-only
+            // gave a = 5.43875 at cost 98189, against 5.43169 at cost 6061 with no constraint at
+            // all.) So: first clip the step back to the feasible region, and if we are already
+            // hard against the boundary, freeze the four variance terms and take the step in the
+            // remaining directions -- an active-set step that keeps everything else refining.
+            // Backtracking is tried FIRST but only over a few halvings. Allowing it to run all
+            // the way down would always "succeed" with a step of order 1e-6 that is technically
+            // feasible and technically downhill, whereupon the relative-cost test declares
+            // convergence after a dozen microscopic iterations (measured: cost 240616, lattice
+            // essentially unmoved). A short backtrack, then a full-size active-set step, is what
+            // actually lets the lattice keep converging while the profile sits on its bound.
+            const MIN_BACKTRACK = 0.125;
+            const makeFeasibleStep = (p_current_vec, p_step) => {
+                let t = 1;
+                while (t >= MIN_BACKTRACK) {
+                    const cand = add(p_current_vec, scale(p_step, t));
+                    if (trialIsPhysical(cand)) return { vec: cand, clipped: t < 1 };
+                    t *= 0.5;
+                }
+                if (varianceIdx.length === 0) return null;
+                // Zeroing these components leaves sigma^2 exactly as it is at the (feasible)
+                // base point, so the result is feasible by construction, and the remaining
+                // directions get their full step.
+                const reduced = [...p_step];
+                varianceIdx.forEach(i => reduced[i] = 0);
+                const cand = add(p_current_vec, reduced);
+                return trialIsPhysical(cand) ? { vec: cand, clipped: true } : null;
+            };
+
+            const MAX_LAMBDA_ESCALATIONS = 12;
+            let prevBaseCost = Infinity, JtJ = null;
+            let lastStepAccepted = true, converged = false, iterationsUsed = 0, varianceBlocked = 0;
+
             for (let iter = 0; iter < maxIter; iter++) {
-                let p_current_vec = paramMapping.map(m => m.get(params));
+                iterationsUsed = iter + 1;
+                const p_current_vec = paramMapping.map(m => m.get(params));
 
                 // Refresh hkl list and re-extract intensities at current parameters.
                 const hklFrozen = buildFrozenHkl(params);
@@ -2016,8 +2265,16 @@ const parsePhilipsUdfFile = (text) => {
                 // relative change between iterations is tiny even while parameters are still
                 // moving. A 1e-9 relative tolerance after a single iteration therefore stopped
                 // the refinement prematurely; require a few iterations and a looser tolerance.
-                if (iter > 3 && Math.abs(last_cost - cost) < 1e-7 * Math.max(cost, 1e-12)) break;
-                last_cost = cost;
+                //
+                // The `lastStepAccepted` guard matters just as much: a REJECTED step leaves the
+                // parameters untouched, so the next base cost is necessarily unchanged and this
+                // test fired on it, declaring victory after one failed trial instead of raising
+                // lambda and trying again. Comparing two base points is only meaningful when the
+                // refinement actually moved between them.
+                if (iter > 3 && lastStepAccepted && Math.abs(prevBaseCost - cost) < 1e-7 * Math.max(cost, 1e-12)) {
+                    converged = true; break;
+                }
+                prevBaseCost = cost;
 
                 // Forward-difference Jacobian. Intensities are frozen across the columns,
                 // but the optimal scale is recomputed inside each residual call so the
@@ -2031,27 +2288,65 @@ const parsePhilipsUdfFile = (text) => {
                 const J = transpose(jacobian);
                 JtJ = multiply(transpose(J), J);
                 const Jtr = multiply(transpose(J), weightedResiduals);
-                const A_lm = JSON.parse(JSON.stringify(JtJ));
-                for (let i = 0; i < A_lm.length; i++) A_lm[i][i] += lambda * (A_lm[i][i] || 1.0);
-                const p_step = solve(A_lm, Jtr);
-                if (p_step.some(isNaN)) break;
 
-                // No trust region and no parameter bounds: the step is accepted only if it
-                // actually lowers the cost, and the Marquardt lambda already damps the step
-                // when the normal matrix is ill-conditioned.
-                const p_new_vec = add(p_current_vec, p_step);
-                const { wr: new_wr } = weightedResidualsAndScale(p_new_vec, params, hklFrozen);
-                const new_cost = dot(new_wr, new_wr);
+                // Inner Marquardt loop: keep raising lambda until a downhill, physically
+                // admissible step appears. The Jacobian is reused, so each retry costs one
+                // residual evaluation rather than a full re-linearisation. If no lambda at all
+                // produces a downhill step we are at a genuine minimum -- that, and not an
+                // unchanged cost, is the correct convergence criterion.
+                lastStepAccepted = false;
+                for (let attempt = 0; attempt < MAX_LAMBDA_ESCALATIONS; attempt++) {
+                    const A_lm = JSON.parse(JSON.stringify(JtJ));
+                    for (let i = 0; i < A_lm.length; i++) A_lm[i][i] += lambda * (A_lm[i][i] || 1.0);
+                    const p_step = solve(A_lm, Jtr);
+                    if (p_step.some(isNaN)) break;
 
-                if (new_cost < cost && isFinite(new_cost)) {
-                    paramMapping.forEach((m, i) => m.set(params, p_new_vec[i]));
-                    lambda = Math.max(lambda / 2, 1e-9);
-                } else {
-                    lambda = Math.min(lambda * 2, 1e9);
+                    const feasible = makeFeasibleStep(p_current_vec, p_step);
+                    if (!feasible) {
+                        varianceBlocked++;
+                        lambda = Math.min(lambda * 10, 1e9);
+                        continue;
+                    }
+                    if (feasible.clipped) varianceBlocked++;
+                    const p_new_vec = feasible.vec;
+
+                    const { wr: new_wr } = weightedResidualsAndScale(p_new_vec, params, hklFrozen);
+                    const new_cost = dot(new_wr, new_wr);
+
+                    if (new_cost < cost && isFinite(new_cost)) {
+                        paramMapping.forEach((m, i) => m.set(params, p_new_vec[i]));
+                        lambda = Math.max(lambda / 3, 1e-9);
+                        lastStepAccepted = true;
+                        break;
+                    }
+                    lambda = Math.min(lambda * 10, 1e9);
                 }
+
+                if (!lastStepAccepted) { converged = true; break; }
+
                 if (progressCallback) await progressCallback((iter + 1) / maxIter, null);
             }
-            return { params, JtJ, ss_res: last_cost, algorithm: 'lm', paramMapping, fitFlags, constraints };
+
+            // Final normal matrix and residual, evaluated AT THE RETURNED PARAMETERS. Previously
+            // `ss_res` was the base cost of the last iteration and `JtJ` its Jacobian, both taken
+            // BEFORE the last accepted step, so the reduced chi-square driving every ESD belonged
+            // to a point the refinement had already left (measured ~3% high on runs truncated by
+            // the iteration cap). One extra evaluation here makes the reported uncertainties
+            // consistent with the reported parameters.
+            const p_final = paramMapping.map(m => m.get(params));
+            const hklFinal = buildFrozenHkl(params);
+            const { wr: wr_final } = weightedResidualsAndScale(p_final, params, hklFinal);
+            const ss_res = dot(wr_final, wr_final);
+            const jacFinal = paramMapping.map((m, i) => {
+                const p_plus = [...p_final]; p_plus[i] += m.step;
+                const { wr } = weightedResidualsAndScale(p_plus, params, hklFinal);
+                return scale(subtract(wr, wr_final), -1 / m.step).map(v => isFinite(v) ? v : 0);
+            });
+            const Jf = transpose(jacFinal);
+            JtJ = multiply(transpose(Jf), Jf);
+
+            return { params, JtJ, ss_res, algorithm: 'lm', paramMapping, fitFlags, constraints,
+                     converged, iterationsUsed, varianceRepair, varianceBlocked };
         }
 
         // Build HKL marker bar data, skipping any peaks whose corrected 2θ falls outside the
@@ -2461,6 +2756,11 @@ const parsePhilipsUdfFile = (text) => {
                 if (fitResults.widthWarning) {
                     doc.setTextColor(200, 0, 0);
                     doc.splitTextToSize(fitResults.widthWarning, pdfWidth - 2 * margin).forEach(l => addLine(l));
+                    doc.setTextColor(0, 0, 0);
+                }
+                if (fitResults.convergenceWarning) {
+                    doc.setTextColor(200, 0, 0);
+                    doc.splitTextToSize(fitResults.convergenceWarning, pdfWidth - 2 * margin).forEach(l => addLine(l));
                     doc.setTextColor(0, 0, 0);
                 }
                 
