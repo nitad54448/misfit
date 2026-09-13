@@ -617,6 +617,7 @@
  */
 const detectAndParseFile = (fileName, fileContent) => {
     const name = fileName.toLowerCase();
+    if (name.endsWith('.brml') && fileContent.startsWith('PK')) throw new Error('Compressed BRML is not supported. Export a two-column XY scan from the instrument software.');
     const lines = fileContent.trim().split(/\r?\n/);
     const firstLine = lines.length > 0 ? lines[0].trim() : '';
 
@@ -636,7 +637,7 @@ const detectAndParseFile = (fileName, fileContent) => {
         return parsePhilipsUdfFile(fileContent);
     }
     // Check for GSAS file by looking for 'BANK' on the second line
-    if (lines.length > 2 && lines[1].toUpperCase().includes('BANK')) {
+    if (lines.some(line => /^\s*BANK\s/i.test(line))) {
          return parseGsasEsdFile(fileContent);
     }
     // Fallback to generic 2-column parser
@@ -732,7 +733,7 @@ const parseRigakuRasFile = (text) => {
         if (upperLine.startsWith('*WAVE_LENGTH') || upperLine.startsWith('*MEAS_COND_XG_WAVE_LENGTH')) {
             const parts = line.trim().split(/\s+/);
             if (parts.length > 1) {
-                const wl = parseFloat(parts[1]);
+                const wl = parseFloat(parts[1].replace(/["']/g, ''));
                 if (!isNaN(wl)) wavelength = wl;
             }
         }
@@ -761,51 +762,34 @@ const parseRigakuRasFile = (text) => {
 
 /** Parses GSAS ESD format. */
 const parseGsasEsdFile = (text) => {
-    const lines = text.trim().split(/\r?\n/);
-    let wavelength = null;
-    let startTth, stepSize;
-    let dataStartIndex = -1;
-
-    lines.forEach((line, index) => {
-        const upperLine = line.toUpperCase();
-        
-        if (upperLine.includes('WAVELENGTH')) {
-            const match = line.match(/wavelength\s+([0-9.]+)/i);
-            if (match && match[1]) wavelength = parseFloat(match[1]);
-        }
-
-        if (upperLine.startsWith('BANK')) {
-            const parts = line.trim().split(/\s+/);
-            if (parts.length >= 6 && parts[4].toUpperCase() === 'CONST') {
-                startTth = parseFloat(parts[5]) / 100.0;
-                stepSize = parseFloat(parts[6]) / 100.0;
-                dataStartIndex = index + 1;
-            }
-        }
-    });
-
-    if (startTth === undefined || stepSize === undefined) {
-        throw new Error("GSAS Parse Error: Could not find a valid 'BANK' line with CONST scan parameters.");
+    const lines = text.split(/\r?\n/);
+    const banks = lines.map((line, index) => /^\s*BANK\s/i.test(line) ? index : -1).filter(index => index >= 0);
+    if (banks.length !== 1) throw new Error('Import one GSAS bank at a time. Export the desired bank separately.');
+    const bankIndex = banks[0];
+    const fields = lines[bankIndex].trim().split(/\s+/);
+    if (fields[4]?.toUpperCase() !== 'CONST' || fields[fields.length - 1]?.toUpperCase() !== 'ESD') {
+        throw new Error('This importer supports GSAS CONST ESD data. Export other GSAS formats as two-column XY data.');
     }
-    if (dataStartIndex !== -1 && lines[dataStartIndex]?.toUpperCase().includes('STD')) {
-        dataStartIndex++;
+    const count = Number(fields[2]), start = Number(fields[5]) / 100, step = Number(fields[6]) / 100;
+    if (!Number.isInteger(count) || count < 2 || !Number.isFinite(start) || !Number.isFinite(step) || step <= 0) {
+        throw new Error('Invalid GSAS BANK channel count or scan parameters.');
     }
-    if (dataStartIndex === -1 || dataStartIndex >= lines.length) {
-        throw new Error("GSAS Parse Error: Found scan parameters but no subsequent data lines.");
-    }
-    
     const intensity = [];
-    for (let i = dataStartIndex; i < lines.length; i++) {
-        const parts = lines[i].trim().split(/\s+/);
-        for (let j = 1; j < parts.length; j += 2) {
-            const val = parseFloat(parts[j]);
-            if (!isNaN(val)) intensity.push(val);
-        }
+    for (let i = bankIndex + 1; i < lines.length && intensity.length < count; i++) {
+        const line = lines[i];
+        if (!line.trim() || /^\s*#/.test(line)) continue;
+        // GSAS ESD uses pairs of 8-character fields: intensity, then uncertainty.
+        // Reference: GSAS-II G2pwd_fxye.GetESDdata.
+        let fields = [];
+        for (let j = 0; j < line.trimEnd().length; j += 8) fields.push(line.slice(j, j + 8).trim());
+        const validFields = values => values.length % 2 === 0 && values.every(v => v !== '' && Number.isFinite(Number(v)));
+        if (!validFields(fields)) fields = line.trim().split(/\s+/);
+        if (!validFields(fields)) throw new Error(`Invalid GSAS intensity/ESD pairs on line ${i + 1}.`);
+        for (let j = 0; j < fields.length && intensity.length < count; j += 2) intensity.push(Number(fields[j]));
     }
-
-    if (intensity.length === 0) throw new Error("GSAS Parse Error: No intensity data could be parsed.");
-    const tth = Array.from({ length: intensity.length }, (_, i) => startTth + i * stepSize);
-    return { tth, intensity, wavelength };
+    if (intensity.length !== count) throw new Error('GSAS data is truncated: channel count does not match BANK.');
+    const wl = text.match(/wavelength\s*[=:]?\s*([0-9.eE+-]+)/i);
+    return {tth: intensity.map((_, i) => start + i * step), intensity, wavelength: wl ? Number(wl[1]) : null};
 };
 
 /** Parses UXD format. */
@@ -818,6 +802,8 @@ const parseUxdFile = (text) => {
     for (const line of lines) {
         const trimmedLine = line.trim();
         if (inDataSection) {
+            if (trimmedLine.startsWith('_')) break;
+            if (!trimmedLine || trimmedLine.startsWith(';')) continue;
             const parts = trimmedLine.split(/\s+/);
             parts.forEach(part => {
                 const val = parseFloat(part);
@@ -879,6 +865,7 @@ const parsePhilipsUdfFile = (text) => {
             const minTth = parseFloat(controls.tthMinSlider.value);
             const maxTth = parseFloat(controls.tthMaxSlider.value);
             const startIndex = fullExperimentalData.tth.findIndex(t => t >= minTth);
+            if (startIndex < 0 || !(minTth < maxTth)) return { tth: [], intensity: [] };
             let endIndex = fullExperimentalData.tth.findIndex(t => t > maxTth);
             if (endIndex === -1) endIndex = fullExperimentalData.tth.length;
 
@@ -935,10 +922,9 @@ const parsePhilipsUdfFile = (text) => {
             let active = [];
             const dropped = [];
             const nameOf = i => paramNames[i] || `#${i}`;
-            const diagMax = Math.max(...JtJ.map((r, i) => (isFinite(r[i]) ? Math.abs(r[i]) : 0)), 0);
             for (let i = 0; i < n; i++) {
                 const v = JtJ[i][i];
-                if (!isFinite(v) || v <= 0 || (diagMax > 0 && v < 1e-14 * diagMax)) {
+                if (!Number.isFinite(v) || v <= 0) {
                     dropped.push({ name: nameOf(i), reason: 'no influence on the pattern' });
                 } else {
                     active.push(i);
@@ -1025,6 +1011,7 @@ const parsePhilipsUdfFile = (text) => {
             document.body.appendChild(element);
             element.click();
             document.body.removeChild(element);
+            setTimeout(() => URL.revokeObjectURL(element.href), 1000);
         }
 
 
@@ -1127,6 +1114,7 @@ const parsePhilipsUdfFile = (text) => {
             reportLines.push(`Data File: ${controls.fileName.textContent}`);
             reportLines.push('');
             reportLines.push('--- Refinement Statistics ---');
+            reportLines.push('Weights: 1/max(observed intensity, 1); imported ESD columns are not used.');
             reportLines.push(`Rp (%):      ${stats.r_p.toFixed(4)}`);
             reportLines.push(`Rwp (%):     ${stats.rwp.toFixed(4)}`);
             reportLines.push(`Reduced χ²: ${stats.chi2.toFixed(4)}    (GoF = √χ²ᵣ = ${Math.sqrt(Math.max(0, stats.chi2)).toFixed(4)})`);
@@ -1186,7 +1174,7 @@ const parsePhilipsUdfFile = (text) => {
             });
             reportLines.push('');
 
-            const maxTth = Math.max(...fullExperimentalData.tth);
+            const maxTth = fullExperimentalData.tth[fullExperimentalData.tth.length - 1];
             const hklList1 = generateHKL(maxTth, finalParams.phase1, finalParams.phase1.system, finalParams.phase1.centering, 'P1');
             const hklList2 = generateHKL(maxTth, finalParams.phase2, finalParams.phase2.system, finalParams.phase2.centering, 'P2');
             const combinedHklList = hklList1.concat(hklList2).sort((a,b) => a.tth - b.tth);
@@ -1213,8 +1201,7 @@ const parsePhilipsUdfFile = (text) => {
             reportLines.push(['2theta'.padStart(12), 'I_obs'.padStart(15), 'I_calc'.padStart(15), 'Difference'.padStart(15)].join(' '));
             reportLines.push('-'.repeat(60));
             
-            const netPattern = calculateNetPattern(fullExperimentalData.tth, combinedHklList, finalParams);
-            const scaledNetPattern = netPattern.map(y => y * stats.scaleFactor);
+            const scaledNetPattern = fitResults.scaledPeakPattern;
             const totalCalcPattern = scaledNetPattern.map((y,i) => y + calculatedBackground[i]);
 
             for (let i = 0; i < fullExperimentalData.tth.length; i++) {
@@ -1290,13 +1277,16 @@ const parsePhilipsUdfFile = (text) => {
         function generateHKL(maxTth, phaseParams, system, centering, phaseTag) {
             const { a, b, c, alpha, beta } = phaseParams;
             const lambda = parseFloat(controls.wavelength.value);
-            if (!a || !lambda || a <= 0) return [];
+            if (!Number.isFinite(a) || !Number.isFinite(lambda) || a <= 0 || lambda <= 0 || !Number.isFinite(maxTth)) return [];
 
             const reflections = new Map();
             const maxLatticeParam = Math.max(a || 0, b || 0, c || 0);
             if (maxLatticeParam === 0) return [];
             const maxIndex = Math.ceil(2 * maxLatticeParam / lambda * Math.sin(maxTth / 2 * Math.PI / 180)) + 2;
             
+            if (!Number.isFinite(maxIndex) || maxIndex > 100) {
+                throw new Error('Reflection search is too large. Check the cell dimensions and wavelength (angstroms).');
+            }
             const deg2rad = Math.PI / 180;
             
             // For low-symmetry systems (monoclinic), (h,k,l) and (h,k,-l) are NOT equivalent
@@ -1312,7 +1302,7 @@ const parsePhilipsUdfFile = (text) => {
                 switch(centering) {
                     case 'P': allowed = true; break;
                     case 'I': allowed = (h + k + l) % 2 === 0; break;
-                    case 'F': allowed = (h % 2 === k % 2) && (k % 2 === l % 2); break;
+                    case 'F': allowed = (h - k) % 2 === 0 && (k - l) % 2 === 0; break;
                     case 'C': allowed = (h + k) % 2 === 0; break;
                     case 'R': allowed = (system === 'hexagonal') ? (-h + k + l) % 3 === 0 : true; break;
                     default: allowed = true;
@@ -1559,7 +1549,7 @@ const parsePhilipsUdfFile = (text) => {
         }
 
         function calculateNetPattern(tthAxis, hklList, params) {
-            const pattern = new Float32Array(tthAxis.length).fill(0);
+            const pattern = new Float64Array(tthAxis.length).fill(0);
             const contexts = buildPeakContexts(tthAxis, hklList, params);
             for (const c of contexts) {
                 if (!c) continue;
@@ -1630,6 +1620,8 @@ const parsePhilipsUdfFile = (text) => {
         let lastLeBailSettled = true;
 
         function leBailIntensityExtraction(exp_net, hklList, params, cycleOverride = null) {
+            lastLeBailCycles = 0;
+            lastLeBailSettled = true;
             const M = hklList.length;
             if (M === 0) return;
             const tth = exp_net.tth;
@@ -1682,6 +1674,7 @@ const parsePhilipsUdfFile = (text) => {
             const sumCalc = new Float64Array(N);
             const Inew = new Float64Array(M);
             let cyclesUsed = 0;
+            let settled = false;
 
             for (let cyc = 0; cyc < maxCycles; cyc++) {
                 cyclesUsed = cyc + 1;
@@ -1720,11 +1713,11 @@ const parsePhilipsUdfFile = (text) => {
                 }
 
                 // Stop when the partition has actually settled, not after an arbitrary count.
-                if (maxNew > 0 && maxChange < LEBAIL_TOL * maxNew) break;
+                if (maxChange <= LEBAIL_TOL * Math.max(maxNew, 1e-30)) { settled = true; break; }
             }
 
             lastLeBailCycles = cyclesUsed;
-            lastLeBailSettled = cyclesUsed < maxCycles;
+            lastLeBailSettled = settled;
             for (let k = 0; k < M; k++) hklList[k].intensity = I[k] * step;
         }
 
@@ -1746,7 +1739,7 @@ const parsePhilipsUdfFile = (text) => {
                 sum_w_obs_net_calc_net += w_for_scale[i] * y_obs_net[i] * y_calc_net[i];
                 sum_w_calc_net_sq      += w_for_scale[i] * y_calc_net[i] * y_calc_net[i];
             }
-            const scaleFactor = sum_w_calc_net_sq > 0 ? sum_w_obs_net_calc_net / sum_w_calc_net_sq : 1.0;
+            const scaleFactor = sum_w_calc_net_sq > 0 ? Math.max(0, sum_w_obs_net_calc_net / sum_w_calc_net_sq) : 1.0;
             const y_calc_total = y_calc_net.map((y, i) => (scaleFactor * y) + y_bkg[i]);
 
             const weights = y_obs_total.map(y => 1 / Math.max(y, 1));
@@ -1814,6 +1807,7 @@ const parsePhilipsUdfFile = (text) => {
         async function runLeBailFit() {
             if (isFitting) return;
             isFitting = true; fitResults = null; setUIState(true);
+            try {
             await new Promise(resolve => setTimeout(resolve, 10));
             
             updateAndApplyBackground();
@@ -1833,6 +1827,18 @@ const parsePhilipsUdfFile = (text) => {
             // ------
             const workingData_net = getWorkingData(true);
             const workingData_total = getWorkingData(false);
+            const parameterCount = getParameterMapping(fitFlags, constraints).paramMapping.length;
+            if (workingData_net.tth.length < Math.max(2, parameterCount + 1)) {
+                throw new Error('Select a range with more data points than refined parameters.');
+            }
+            for (const el of document.querySelectorAll('#controls-panel input[type="number"]')) {
+                // Disabled fields can be constrained; only fields with a numerical value enter the model.
+                if (!Number.isFinite(Number(el.value)) || el.value.trim() === '' ||
+                    (el.min && Number(el.value) < Number(el.min)) || (el.max && Number(el.value) > Number(el.max))) {
+                    throw new Error(`Enter a valid value for ${el.id}.`);
+                }
+            }
+            if (!(params.lambda > 0)) throw new Error('Wavelength must be positive.');
             // --- -
 
             let results;
@@ -1853,7 +1859,7 @@ const parsePhilipsUdfFile = (text) => {
             const finalParams = fitResults.params;
             
             const workingData = getWorkingData(true);
-            const maxTth = Math.max(...workingData.tth);
+            const maxTth = workingData.tth[workingData.tth.length - 1];
             let hklList1 = generateHKL(maxTth, finalParams.phase1, finalParams.phase1.system, finalParams.phase1.centering, 'P1');
             let hklList2 = generateHKL(maxTth, finalParams.phase2, finalParams.phase2.system, finalParams.phase2.centering, 'P2');
             let combinedHklList = hklList1.concat(hklList2).sort((a,b)=>a.tth-b.tth);
@@ -1954,8 +1960,15 @@ const parsePhilipsUdfFile = (text) => {
             
             const scaledPeakPattern_full = calculateNetPattern(fullExperimentalData.tth, combinedHklList, finalParams).map(y => y * finalStats.scaleFactor);
             
+            fitResults.scaledPeakPattern = Array.from(scaledPeakPattern_full);
             updateUI(finalParams, finalStats, scaledPeakPattern_full, calculatedBackground);
-            isFitting = false; setUIState(false);
+            } catch (error) {
+                invalidateFit();
+                console.error(error);
+                alert(`Refinement failed: ${error.message}`);
+            } finally {
+                setUIState(false);
+            }
         }
 
 
@@ -2048,8 +2061,8 @@ const parsePhilipsUdfFile = (text) => {
 
             const workingData = getWorkingData(true);
             if (workingData.tth.length === 0) return { params: initialParams };
-            const maxTth = Math.max(...workingData.tth);
-            const minTthSA = Math.min(...workingData.tth);
+            const maxTth = workingData.tth[workingData.tth.length - 1];
+            const minTthSA = workingData.tth[0];
             // Same guard as the LM path: where the Gaussian variance is non-positive the profile
             // is clamped and the pattern becomes completely insensitive to GU/GV/GW/GP, so the
             // walk could wander into that region and never feel its way out. Repair the start,
@@ -2079,7 +2092,7 @@ const parsePhilipsUdfFile = (text) => {
                 //   s = Σ(w · y_obs · y_calc) / Σ(w · y_calc²)
                 let num = 0, den = 0;
                 for (let i = 0; i < yo.length; i++) { num += saWeights[i] * yo[i] * yc[i]; den += saWeights[i] * yc[i] * yc[i]; }
-                const s = den > 1e-30 ? num / den : 1.0;
+                const s = den > 1e-30 ? Math.max(0, num / den) : 1.0;
                 let wsse = 0;
                 for (let i = 0; i < yo.length; i++) { const r = yo[i] - s * yc[i]; wsse += saWeights[i] * r * r; }
                 return wsse;
@@ -2088,6 +2101,7 @@ const parsePhilipsUdfFile = (text) => {
             const maxSteps = Math.max(1, maxIter);
             let current_x = paramMapping.map(m => m.get(saParams));
             let current_cost = objective(current_x, saParams);
+            const initial_cost = current_cost;
             let best_x = [...current_x], best_cost = current_cost;
 
             // --- Temperature must be calibrated to the SCALE OF THE COST FUNCTION ---
@@ -2142,7 +2156,7 @@ const parsePhilipsUdfFile = (text) => {
             let finalParams = JSON.parse(JSON.stringify(saParams));
             paramMapping.forEach((m, i) => m.set(finalParams, best_x[i]));
             return { params: finalParams, algorithm: 'sa', paramMapping, fitFlags, constraints,
-                     saAcceptance: accepted / maxSteps, saInitialCost: best_cost, varianceRepair };
+                     saAcceptance: accepted / maxSteps, saInitialCost: initial_cost, varianceRepair };
         }
         
 
@@ -2157,8 +2171,8 @@ const parsePhilipsUdfFile = (text) => {
             const sqrtW = weights.map(w => Math.sqrt(w));
             const N = workingData.intensity.length;
 
-            const maxTth = Math.max(...workingData.tth);
-            const minTth = Math.min(...workingData.tth);
+            const maxTth = workingData.tth[workingData.tth.length - 1];
+            const minTth = workingData.tth[0];
 
             // A starting point whose Gaussian variance is already non-positive has no gradient in
             // GU/GV/GW/GP at all, so the refinement could never leave it. Lift it back into the
@@ -2189,7 +2203,7 @@ const parsePhilipsUdfFile = (text) => {
                 const yo = workingData.intensity;
                 let num = 0, den = 0;
                 for (let i = 0; i < N; i++) { num += weights[i] * yo[i] * yc[i]; den += weights[i] * yc[i] * yc[i]; }
-                const s = den > 1e-30 ? num / den : 1.0;
+                const s = den > 1e-30 ? Math.max(0, num / den) : 1.0;
                 const wr = new Array(N);
                 for (let i = 0; i < N; i++) wr[i] = sqrtW[i] * (yo[i] - s * yc[i]);
                 return { wr, s };
@@ -2366,6 +2380,8 @@ const parsePhilipsUdfFile = (text) => {
             if (!mainChart || fullExperimentalData.tth.length === 0 || isFitting) return;
             const findDataset = (label) => mainChart.data.datasets.find(d => d.label === label);
 
+            const numericInputs = document.querySelectorAll('#controls-panel input[type="number"]');
+            if (Array.from(numericInputs).some(el => el.value.trim() === '' || !Number.isFinite(Number(el.value)) || (el.validity.badInput || el.validity.rangeUnderflow || el.validity.rangeOverflow))) return;
             let params = getAllParams();
             const constraints = getConstraints();
             Object.keys(constraints).forEach(key => {
@@ -2376,8 +2392,11 @@ const parsePhilipsUdfFile = (text) => {
             // Limit peak generation and marker drawing to the active 2θ range.
             const tthMin = parseFloat(controls.tthMinSlider.value);
             const tthMax = parseFloat(controls.tthMaxSlider.value);
-            const hklList1 = generateHKL(tthMax, params.phase1, params.phase1.system, params.phase1.centering, 'P1');
-            const hklList2 = generateHKL(tthMax, params.phase2, params.phase2.system, params.phase2.centering, 'P2');
+            let hklList1, hklList2;
+            try {
+                hklList1 = generateHKL(tthMax, params.phase1, params.phase1.system, params.phase1.centering, 'P1');
+                hklList2 = generateHKL(tthMax, params.phase2, params.phase2.system, params.phase2.centering, 'P2');
+            } catch (error) { console.warn(error.message); return; }
             lastGeneratedHklList = hklList1.concat(hklList2).sort((a, b) => a.tth - b.tth);
 
             // Always refresh HKL tick markers (cheap, and they depend on lattice / zeroShift).
@@ -2388,11 +2407,9 @@ const parsePhilipsUdfFile = (text) => {
             findDataset('HKL P1').data = buildHklMarkers(hklList1, params, p1_top_y, markerBarHeight, tthMin, tthMax);
             findDataset('HKL P2').data = buildHklMarkers(hklList2, params, p2_top_y, markerBarHeight, tthMin, tthMax);
 
-            // If a refinement has produced a real Calculated/Difference curve, leave them alone
-            // and don't paint a manual simulation on top — the user is just exploring controls,
-            // not re-modelling. Only show the manual simulation in the pre-fit preview state.
+            // Show a manual simulation only while no current refinement is available.
             if (!fitResults) {
-                const arbitraryIntensity = Math.max(...fullExperimentalData.intensity) * 0.5;
+                const arbitraryIntensity = fullExperimentalData.intensity.reduce((max, y) => Math.max(max, y), 1) * 0.5;
                 lastGeneratedHklList.forEach(p => p.intensity = arbitraryIntensity);
                 const netPattern = calculateNetPattern(fullExperimentalData.tth, lastGeneratedHklList, params);
                 const totalSimPattern = netPattern.map((y, i) => y + (calculatedBackground[i] || 0));
@@ -2403,11 +2420,19 @@ const parsePhilipsUdfFile = (text) => {
             mainChart.update('none');
         }
 
+        let fitInputStates = null;
         function setUIState(fitting) {
+            if (fitting && !fitInputStates) {
+                fitInputStates = Array.from(document.querySelectorAll('#controls-panel input, #controls-panel select'), el => [el, el.disabled]);
+                fitInputStates.forEach(([el]) => { el.disabled = true; });
+            } else if (!fitting && fitInputStates) {
+                fitInputStates.forEach(([el, disabled]) => { el.disabled = disabled; });
+                fitInputStates = null;
+            }
             isFitting = fitting;
-            controls.fitButton.disabled = fitting;
-            controls.reportButton.disabled = fitting;
-            controls.saveDataButton.disabled = fitting;
+            controls.fitButton.disabled = fitting || fullExperimentalData.tth.length < 2;
+            controls.reportButton.disabled = fitting || !fitResults;
+            controls.saveDataButton.disabled = fitting || !fitResults;
             controls.fitButton.textContent = fitting ? 'Refining...' : 'Run Refinement';
             controls.progressBarContainer.classList.toggle('hidden', !fitting);
             document.body.style.cursor = fitting ? 'wait' : 'default';
@@ -2445,7 +2470,7 @@ const parsePhilipsUdfFile = (text) => {
             controls.paramShft.value = params.shft.toFixed(4); controls.paramTrns.value = params.trns.toFixed(4);
             
             if (scaledPeakPattern && background) {
-                const maxTth = Math.max(...fullExperimentalData.tth);
+                const maxTth = fullExperimentalData.tth[fullExperimentalData.tth.length - 1];
                 const hklList1 = generateHKL(maxTth, params.phase1, params.phase1.system, params.phase1.centering, 'P1');
                 const hklList2 = generateHKL(maxTth, params.phase2, params.phase2.system, params.phase2.centering, 'P2');
                 updateChart(scaledPeakPattern, background, hklList1, hklList2, params);
@@ -2454,7 +2479,7 @@ const parsePhilipsUdfFile = (text) => {
 
         function initializeChart() {
             if (mainChart) mainChart.destroy();
-            const yMax = Math.max(...fullExperimentalData.intensity) || 1000;
+            const yMax = fullExperimentalData.intensity.reduce((max, y) => Math.max(max, y), 1) || 1000;
             mainChart = new Chart(controls.mainChartCanvas, {
                 type: 'line', data: { datasets: [
                     { label: 'Experimental', data: fullExperimentalData.tth.map((t, i) => ({x: t, y: fullExperimentalData.intensity[i]})), borderColor: 'rgba(107, 114, 128, 0.7)', borderWidth: 1.5, pointRadius: 0, order: 1 },
@@ -2522,13 +2547,61 @@ const parsePhilipsUdfFile = (text) => {
             mainChart.update('none');
         }
 
+        function invalidateFit() {
+            fitResults = null;
+            lastRawDifference = [];
+            controls.reportButton.disabled = true;
+            controls.saveDataButton.disabled = true;
+            [controls.rpResult, controls.rwpResult, controls.chi2Result].forEach(el => { el.textContent = '—'; });
+            if (mainChart) {
+                for (const dataset of mainChart.data.datasets) {
+                    if (['Calculated', 'Difference', 'Difference Zero'].includes(dataset.label)) dataset.data = [];
+                }
+                mainChart.update('none');
+            }
+        }
+        function invalidateChangedModel(event) {
+            const el = event.target;
+            if (isFitting || !fitResults || !el.matches('input, select')) return;
+            if (['file-input', 'iterations-slider', 'algorithm-select'].includes(el.id) || el.id.startsWith('fit-')) return;
+            invalidateFit();
+        }
+        const controlsPanel = document.getElementById('controls-panel');
+        controlsPanel.addEventListener('input', invalidateChangedModel, true);
+        controlsPanel.addEventListener('change', invalidateChangedModel, true);
+
+        function validateScan(data) {
+            if (!data || !Array.isArray(data.tth) || !Array.isArray(data.intensity) ||
+                data.tth.length < 2 || data.tth.length !== data.intensity.length) {
+                throw new Error('The scan must contain at least two matching angle/intensity pairs.');
+            }
+            const n = data.tth.length;
+            const step = (data.tth[n - 1] - data.tth[0]) / (n - 1);
+            if (!(step > 0) || !Number.isFinite(step)) throw new Error('Scan angles must increase.');
+            const tolerance = Math.max(1e-7, step * 1e-3);
+            for (let i = 0; i < n; i++) {
+                if (!Number.isFinite(data.tth[i]) || !Number.isFinite(data.intensity[i]) || data.tth[i] <= 0 || data.tth[i] >= 180) {
+                    throw new Error('Scan values must be finite and 2-theta must be between 0 and 180 degrees.');
+                }
+                if (i && (data.tth[i] <= data.tth[i - 1] || Math.abs(data.tth[i] - data.tth[i - 1] - step) > tolerance)) {
+                    throw new Error('This fitter requires evenly spaced, increasing angles. Resample the scan before importing.');
+                }
+            }
+            if (data.wavelength != null && (!Number.isFinite(data.wavelength) || data.wavelength <= 0)) {
+                throw new Error('The file contains an invalid wavelength.');
+            }
+            return data;
+        }
+
         controls.fileInput.addEventListener('change', (e) => {
     const file = e.target.files[0];
     if (!file) return;
     const reader = new FileReader();
     reader.onload = (evt) => {
         try {
-            const parsedData = detectAndParseFile(file.name, evt.target.result);
+            const parsedData = validateScan(detectAndParseFile(file.name, evt.target.result));
+            if (typeof Chart !== 'function') throw new Error('Chart.js could not load. Check your internet connection and reload.');
+            invalidateFit();
             
             if (!parsedData || !parsedData.tth || parsedData.tth.length === 0) {
                 throw new Error("No valid data points could be parsed from the file.");
@@ -2566,8 +2639,9 @@ const parsePhilipsUdfFile = (text) => {
                 slider.step = step;
                 slider.disabled = false;
             });
-            controls.tthMinSlider.value = Math.max(min, 10);
-            controls.tthMaxSlider.value = Math.min(max, 100);
+            const overlapMin = Math.max(min, 10), overlapMax = Math.min(max, 100);
+            controls.tthMinSlider.value = overlapMin < overlapMax ? overlapMin : min;
+            controls.tthMaxSlider.value = overlapMin < overlapMax ? overlapMax : max;
             controls.tthMinValue.textContent = parseFloat(controls.tthMinSlider.value).toFixed(1); 
             controls.tthMaxValue.textContent = parseFloat(controls.tthMaxSlider.value).toFixed(1);
             
@@ -2590,12 +2664,8 @@ const parsePhilipsUdfFile = (text) => {
         document.getElementById('controls-panel').addEventListener('input', (event) => {
             const target = event.target;
             const targetId = target.id;
-            // Toggling a fit-checkbox or constraint-checkbox does not change any model parameter
-            // (it only flags what gets refined next time), so don't redraw — redrawing would wipe
-            // the post-fit Calculated/Difference curves and replace them with a flat-intensity
-            // manual simulation. Constraint-value mirroring is handled by handleParameterSync,
-            // which still runs for VALUE changes via the if-branch below.
-            if (target.type === 'checkbox') return;
+            // Fit flags apply to the next run; keep constrained flags synchronized.
+            if (target.type === 'checkbox') { handleParameterSync(target); return; }
             if ((target.tagName === 'INPUT' || target.tagName === 'SELECT') && !['file-input', 'tth-min-slider', 'tth-max-slider', 'iterations-slider', 'ball-radius-slider', 'smoothing-width-slider'].includes(targetId)) {
                 handleParameterSync(target);
                 updatePreviewPattern();
@@ -2911,14 +2981,14 @@ const parsePhilipsUdfFile = (text) => {
         controls.smoothingWidthSlider.addEventListener('input', () => { controls.smoothingWidthValue.textContent = controls.smoothingWidthSlider.value; updateAndApplyBackground(); });
         
         controls.mainChartCanvas.addEventListener('wheel', e => {
-            e.preventDefault(); const chart = mainChart; if (!chart || !chart.chartArea) return;
+            e.preventDefault(); const chart = mainChart; if (!chart || !chart.chartArea || typeof chart.zoom !== 'function') return;
             const { left, right, top, bottom } = chart.chartArea; const x = e.offsetX, y = e.offsetY;
             const zoomFactor = e.deltaY < 0 ? 1.1 : 0.9;
             if (y > bottom) chart.zoom({ x: zoomFactor }, { x, y });
             else if (x < left) chart.zoom({ y: zoomFactor }, { x, y });
             else if (x >= left && x <= right && y >= top && y <= bottom) chart.zoom({ x: zoomFactor, y: zoomFactor }, { x, y });
-        });
-        controls.mainChartCanvas.addEventListener('contextmenu', e => { e.preventDefault(); if (mainChart) mainChart.resetZoom(); });
+        }, { passive: false });
+        controls.mainChartCanvas.addEventListener('contextmenu', e => { e.preventDefault(); if (mainChart && typeof mainChart.resetZoom === 'function') mainChart.resetZoom(); });
 
         // Help button: open the standalone help page in a new tab/window.
         document.getElementById('help-button').addEventListener('click', () => {
