@@ -357,22 +357,25 @@ footer {
     and the partition is iterated to self-consistency:
 </p>
 
-<span class="eq">I<sub>k</sub>(new)&nbsp;=&nbsp;Σ<sub>i</sub>&nbsp;y<sub>obs</sub>(i)&nbsp;·&nbsp;[&nbsp;I<sub>k</sub>·Ω<sub>k</sub>(i)&nbsp;]&nbsp;/&nbsp;Σ<sub>k'</sub>&nbsp;I<sub>k'</sub>·Ω<sub>k'</sub>(i)</span>
+<span class="eq">I<sub>k</sub>(new)&nbsp;=&nbsp;{Σ<sub>i</sub>&nbsp;[y<sub>obs</sub>(i)&nbsp;·&nbsp;I<sub>k</sub>·Ω<sub>k</sub>(i)&nbsp;/&nbsp;y<sub>calc</sub>(i)]}&nbsp;/&nbsp;Σ<sub>i</sub>&nbsp;Ω<sub>k</sub>(i)</span>
 
 <p>
     Ω<sub>k</sub> is the normalised profile of reflection <em>k</em>. The intensity weighting is
     what makes this Le Bail rather than a plain profile deconvolution: partitioning by Ω alone
     would split every overlapping pair by width only — 50/50 for equal widths — and could never
-    recover the true intensity ratio. Twenty cycles are run per refinement step, and intensities
-    are carried forward between steps as a warm start. Reflections are initialised equal on the
-    first pass, per Le Bail's original prescription, and negative values are clamped to zero.
+    recover the true intensity ratio. Reflections are initialised equally for each extraction,
+    which runs until the partition settles or reaches its cycle budget (25–500 cycles, depending
+    on the number of contributing reflections). Extracted intensities are constrained to be
+    nonnegative; signed background-subtracted observations are retained in both optimizers and
+    in the reported statistics.
 </p>
 
 <div class="note">
     <strong>Note</strong>
-    Extracted intensities are channel sums, so their absolute magnitude scales roughly as 1/Δ2θ
-    and will change if you re-bin your data. Ratios between reflections, and the fit itself, are
-    unaffected — an overall linear scale factor is determined analytically and absorbs it.
+    Extracted intensities use the integrated profile scale. The denominator accounts for the
+    sampled profile inside the fitting range, including partial peaks cut by either boundary.
+    Changing the channel spacing therefore does not introduce an extra 1/Δ2θ intensity factor.
+    An overall linear scale factor is also determined analytically during fitting.
 </div>
 
 <h2>Sample displacement &amp; transparency</h2>
@@ -427,8 +430,10 @@ footer {
     only: the Le Bail intensities and the profiled-out scale factor are extra degrees of freedom
     that absorb part of the residual but are not propagated. Le Bail refinements are inherently
     optimistic this way — treat the numbers as a guide to relative precision, not as absolute
-    uncertainties. A singular matrix (reported as such) means two or more refined parameters are
-    completely correlated; fix one of them.
+    uncertainties. If parameters are completely correlated, every parameter involved in that
+    dependency is reported without an individual ESD. Fix enough parameters in each dependent
+    group and rerun to determine the others. ESDs for identifiable parameters retain the
+    uncertainty associated with fitted nuisance combinations.
 </div>
 
 <h2>Plot interaction</h2>

@@ -874,7 +874,9 @@ const parsePhilipsUdfFile = (text) => {
 
             if (subtractBackground && calculatedBackground.length === fullExperimentalData.intensity.length) {
                 const backgroundSlice = calculatedBackground.slice(startIndex, endIndex);
-                intensity = intensity.map((y, i) => Math.max(0, y - backgroundSlice[i]));
+                // Preserve signed residuals so both optimizers minimize the same objective
+                // as the reported statistics. Only extracted peak intensities are constrained.
+                intensity = intensity.map((y, i) => y - backgroundSlice[i]);
             }
             return { tth, intensity };
         }
@@ -906,20 +908,16 @@ const parsePhilipsUdfFile = (text) => {
         // dwarfs sensitivity to η or LX), and naive Gauss-Jordan inversion accumulates
         // cancellation errors that look like singularity. Trick: scale to D = diag(1/sqrt(diag)),
         // invert D·JtJ·D (well-conditioned), then unscale: cov = D·(D·JtJ·D)^-1·D.
-        // Rank-revealing covariance. Returns { cov, dropped } where `cov` has NaN entries for
-        // any parameter that could not be determined, and `dropped` names those parameters.
-        //
-        // Previously a SINGLE degenerate parameter made this return null, which wiped out the
-        // ESDs of every other parameter as collateral damage. That is the wrong trade: if one
-        // parameter has no influence on the pattern (a dead Jacobian column), the remaining
-        // parameters are usually perfectly well determined and their ESDs are still meaningful.
-        // So instead of giving up, drop the offenders and invert the surviving submatrix.
+        // Rank-revealing covariance. Every parameter participating in a null direction is
+        // unidentifiable, not just the last parameter encountered by elimination. For identifiable
+        // coordinates, use the full pseudoinverse so uncertainty in fitted nuisance combinations
+        // is retained. Deleting dependent rows/columns would implicitly fix those parameters.
         function covarianceFromJtJ(JtJ, paramNames = []) {
             const n = JtJ.length;
             if (n === 0) return null;
 
             // A dead column shows up as a zero (or non-finite) diagonal entry.
-            let active = [];
+            const active = [];
             const dropped = [];
             const nameOf = i => paramNames[i] || `#${i}`;
             for (let i = 0; i < n; i++) {
@@ -931,53 +929,73 @@ const parsePhilipsUdfFile = (text) => {
                 }
             }
 
-            // Invert the scaled (correlation-form) submatrix, peeling off any parameter whose
-            // pivot collapses -- that is a parameter perfectly correlated with the others.
-            let subInv = null;
-            while (active.length > 0) {
-                const d = active.map(i => 1 / Math.sqrt(JtJ[i][i]));
-                const M = active.map((i, ii) => active.map((j, jj) => JtJ[i][j] * d[ii] * d[jj]));
-                const res = matrixInverseRank(M);
-                if (res.ok) {
-                    subInv = res.inv.map((row, ii) => row.map((v, jj) => v * d[ii] * d[jj]));
-                    break;
-                }
-                const bad = active[res.failIndex];
-                dropped.push({ name: nameOf(bad), reason: 'fully correlated with another refined parameter' });
-                active = active.filter(i => i !== bad);
+            if (active.length === 0) return { cov: null, dropped };
+            const d = active.map(i => 1 / Math.sqrt(JtJ[i][i]));
+            const M = active.map((i, ii) => active.map((j, jj) => JtJ[i][j] * d[ii] * d[jj]));
+            const eig = symmetricEigenDecomposition(M);
+            const rankTolerance = eig ? 1e-10 * Math.max(1, ...eig.values) : 0;
+            if (!eig || eig.values.some(v => v < -rankTolerance)) {
+                active.forEach(i => dropped.push({ name: nameOf(i), reason: 'normal matrix is numerically invalid' }));
+                return { cov: null, dropped };
             }
-            if (!subInv) return { cov: null, dropped };
+
+            const nullModes = eig.values.map((v, k) => v <= rankTolerance ? k : -1).filter(k => k >= 0);
+            const identifiable = active.map((i, ii) => {
+                const nullWeight = nullModes.reduce((sum, k) => sum + eig.vectors[ii][k] ** 2, 0);
+                if (nullWeight > 1e-12) {
+                    dropped.push({ name: nameOf(i), reason: 'fully correlated with other refined parameters' });
+                    return false;
+                }
+                return true;
+            });
+            if (!identifiable.some(Boolean)) return { cov: null, dropped };
 
             const cov = Array.from({ length: n }, () => new Array(n).fill(NaN));
-            active.forEach((i, ii) => active.forEach((j, jj) => { cov[i][j] = subInv[ii][jj]; }));
+            active.forEach((i, ii) => active.forEach((j, jj) => {
+                if (!identifiable[ii] || !identifiable[jj]) return;
+                let v = 0;
+                eig.values.forEach((value, k) => {
+                    if (value > rankTolerance) v += eig.vectors[ii][k] * eig.vectors[jj][k] / value;
+                });
+                cov[i][j] = v * d[ii] * d[jj];
+            }));
             return { cov, dropped };
         }
 
-        // Gauss-Jordan inversion that reports WHICH pivot failed instead of just giving up.
-        function matrixInverseRank(A) {
+        // Jacobi rotations for the small, symmetric normal matrices used by the refiners.
+        // Eigenvectors are columns; retaining null vectors identifies every affected parameter.
+        function symmetricEigenDecomposition(A) {
             const n = A.length;
-            if (n === 0) return { ok: false, failIndex: 0 };
-            const C = A.map((row, i) => [...row, ...Array.from({ length: n }, (_, j) => (i === j ? 1 : 0))]);
-            for (let i = 0; i < n; i++) {
-                let pivot = i;
-                for (let j = i + 1; j < n; j++) if (Math.abs(C[j][i]) > Math.abs(C[pivot][i])) pivot = j;
-                [C[i], C[pivot]] = [C[pivot], C[i]];
-                const div = C[i][i];
-                // The matrix is in correlation form (unit diagonal), so this tolerance is a
-                // genuine, scale-free test of linear dependence. Row swaps permute rows only,
-                // never columns, so a collapsed pivot in column i implicates parameter i.
-                if (!isFinite(div) || Math.abs(div) < 1e-10) return { ok: false, failIndex: i };
-                for (let j = i; j < 2 * n; j++) C[i][j] /= div;
-                for (let j = 0; j < n; j++) {
-                    if (i !== j) {
-                        const mult = C[j][i];
-                        for (let k = i; k < 2 * n; k++) C[j][k] -= mult * C[i][k];
+            if (!n || A.some(row => row.length !== n || row.some(v => !Number.isFinite(v)))) return null;
+            const M = A.map((row, i) => row.map((v, j) => (v + A[j][i]) / 2));
+            const vectors = Array.from({ length: n }, (_, i) => Array.from({ length: n }, (_, j) => i === j ? 1 : 0));
+            for (let sweep = 0; sweep < 100 * n * n; sweep++) {
+                let p = 0, q = 0, largest = 0;
+                for (let i = 0; i < n; i++) {
+                    for (let j = i + 1; j < n; j++) {
+                        if (Math.abs(M[i][j]) > largest) { largest = Math.abs(M[i][j]); p = i; q = j; }
                     }
                 }
+                if (largest < 1e-13) return { values: M.map((row, i) => row[i]), vectors };
+                const tau = (M[q][q] - M[p][p]) / (2 * M[p][q]);
+                const t = (tau >= 0 ? 1 : -1) / (Math.abs(tau) + Math.hypot(1, tau));
+                const c = 1 / Math.sqrt(1 + t * t), s = t * c;
+                const off = M[p][q];
+                M[p][p] -= t * off;
+                M[q][q] += t * off;
+                M[p][q] = M[q][p] = 0;
+                for (let k = 0; k < n; k++) {
+                    if (k !== p && k !== q) {
+                        const kp = M[k][p], kq = M[k][q];
+                        M[k][p] = M[p][k] = c * kp - s * kq;
+                        M[k][q] = M[q][k] = s * kp + c * kq;
+                    }
+                    const vp = vectors[k][p], vq = vectors[k][q];
+                    vectors[k][p] = c * vp - s * vq;
+                    vectors[k][q] = s * vp + c * vq;
+                }
             }
-            // Row swaps are legitimate row operations on [A|I], so the left block ends as an
-            // exact identity and the right block is A^-1 already in natural order.
-            return { ok: true, inv: C.map(row => row.slice(n)) };
+            return null;
         }
 
         function findExperimentalPeakDetails(targetTth, experimentalData, wavelength, searchWindow = 0.5) {
@@ -1090,7 +1108,7 @@ const parsePhilipsUdfFile = (text) => {
                     if (covResult && covResult.dropped.length) {
                         esdWarning = '--> No ESD could be determined for: '
                             + covResult.dropped.map(d => `${d.name} (${d.reason})`).join(', ')
-                            + '. Other parameters are unaffected.';
+                            + '. ESDs are shown only for individually identifiable parameters.';
                     } else if (!cov_matrix) {
                         esdWarning = '--> ESD calculation failed: the normal matrix could not be inverted.';
                     }
@@ -1120,7 +1138,7 @@ const parsePhilipsUdfFile = (text) => {
             reportLines.push(`Reduced χ²: ${stats.chi2.toFixed(4)}    (GoF = √χ²ᵣ = ${Math.sqrt(Math.max(0, stats.chi2)).toFixed(4)})`);
             reportLines.push(`Algorithm:   ${algorithm === 'lm' ? 'Levenberg-Marquardt' : 'Simulated Annealing'}`);
             if (algorithm === 'lm' && fitResults.iterationsUsed !== undefined) {
-                reportLines.push(`Convergence: ${fitResults.converged ? 'reached' : 'NOT reached (hit iteration limit)'}`
+                reportLines.push(`Convergence: ${fitResults.converged ? 'reached' : fitResults.stalled ? 'NOT reached (no downhill step found)' : 'NOT reached (hit iteration limit)'}`
                     + ` after ${fitResults.iterationsUsed} iteration(s)`);
             }
             if (fitResults.leBailCycles !== undefined) {
@@ -1249,6 +1267,21 @@ const parsePhilipsUdfFile = (text) => {
             }
         }
 
+        // Group only reflections whose reciprocal-metric coefficients agree for every cell
+        // in this crystal system. Accidental coincidences (e.g. tetragonal a = c) must remain
+        // separate so their positions can split when LM perturbs an independent parameter.
+        function reflectionFamilyKey(h, k, l, system) {
+            switch (system) {
+                case 'cubic':        return `${h*h + k*k + l*l}`;
+                case 'tetragonal':   return `${h*h + k*k},${l*l}`;
+                case 'orthorhombic': return `${h*h},${k*k},${l*l}`;
+                case 'hexagonal':    return `${h*h + h*k + k*k},${l*l}`;
+                case 'monoclinic':   return `${h*h},${k*k},${l*l},${h*l}`;
+                case 'rhombohedral': return `${h*h + k*k + l*l},${h*k + k*l + l*h}`;
+                default:            return `${h},${k},${l}`;
+            }
+        }
+
         // Recompute the 2-theta of an already-built reflection list from (possibly perturbed)
         // lattice parameters, keeping the extracted intensities frozen.
         //
@@ -1291,7 +1324,7 @@ const parsePhilipsUdfFile = (text) => {
             
             // For low-symmetry systems (monoclinic), (h,k,l) and (h,k,-l) are NOT equivalent
             // because the cross term -2hl*cos(beta)/(ac) flips sign with l. We must scan
-            // negative l for these. Friedel pair (hkl)=(-h,-k,-l) is dedup'd by 2theta key.
+            // negative l for these. Friedel pairs are grouped by their metric coefficients.
             const lMin = (system === 'monoclinic' || system === 'rhombohedral') ? -maxIndex : 0;
             for (let h = -maxIndex; h <= maxIndex; h++) {
             for (let k = -maxIndex; k <= maxIndex; k++) {
@@ -1317,12 +1350,10 @@ const parsePhilipsUdfFile = (text) => {
                     const tth = 2 * Math.asin(Math.sqrt(sinThetaSq)) * (180 / Math.PI);
                     if (tth > maxTth * 1.05) continue;
                     const d = 1 / Math.sqrt(inv_d_sq);
-                    const key = `${phaseTag}-${Math.round(tth * 1000)}`;
+                    const key = `${phaseTag}-${reflectionFamilyKey(h, k, l, system)}`;
                     if (!reflections.has(key)) {
-                        // h,k,l of the representative reflection are retained so the position
-                        // can be recomputed when the cell is perturbed. Symmetry-equivalents
-                        // sharing this 2-theta may split under a perturbation, but for a
-                        // finite-difference step that is a second-order effect.
+                        // All members of this family stay coincident under any allowed cell
+                        // perturbation, so one representative suffices for position refreshes.
                         reflections.set(key, { tth: tth, d: d, hkl_list: [`(${h},${k},${l})`], intensity: 0,
                                                phase: phaseTag, h, k, l, system });
                     } else {
@@ -1570,7 +1601,10 @@ const parsePhilipsUdfFile = (text) => {
         // calculated contributions, I_k * Omega_k(i) -- not by profile shape alone. The
         // partition is then iterated to self-consistency:
         //
-        //   I_k(new) = SUM_i  y_obs(i) * [ I_k(old) * Omega_k(i) ] / SUM_k' I_k'(old) * Omega_k'(i)
+        //   I_k(new) = SUM_i [y_obs(i) * I_k(old) * Omega_k(i) / y_calc(i)] / SUM_i Omega_k(i)
+        //
+        // The denominator is the sampled profile mass INSIDE the fitted range. It keeps
+        // intensities on the integrated scale even when a boundary cuts through a peak.
         //
         // Partitioning by Omega alone (the previous behaviour) splits every overlapping pair
         // by width only -- 50/50 for equal widths -- and can never recover the true intensity
@@ -1628,26 +1662,22 @@ const parsePhilipsUdfFile = (text) => {
             const yobs = exp_net.intensity;
             const N = tth.length;
 
-            const contexts = buildPeakContexts(tth, hklList, params).filter(Boolean);
-            if (contexts.length === 0) { hklList.forEach(p => p.intensity = 0); return; }
-
-            // Channel width. The partition below accumulates SUMS over data points, so its
-            // natural output is the channel sum Sum(y_i), not the integrated intensity
-            // Integral(y d2theta) = step * Sum(y_i). Rescaling by `step` at the end is what puts
-            // the extracted intensities on the same scale as the data, so that Sum_k I_k*Omega_k
-            // reproduces y_obs directly and the linear scale factor computed downstream really
-            // does converge to ~1. Without it the intensities came out a factor 1/step too large
-            // -- a factor of 50 for a 0.02 deg step -- and the reported scale factor silently
-            // tracked the step size instead of approaching unity.
-            const step = N > 1 ? (tth[N - 1] - tth[0]) / (N - 1) : 1;
-
-            // Cache Omega_k(i) once; the iteration below only reweights it.
-            for (const c of contexts) {
+            // Cache Omega_k(i) and its sampled mass once. Dividing by this sum accounts
+            // for both channel spacing and truncation; no final step-size scaling is needed.
+            const contexts = buildPeakContexts(tth, hklList, params).filter(Boolean).filter(c => {
                 const len = c.i1 - c.i0 + 1;
                 const arr = new Float64Array(len);
-                for (let i = c.i0; i <= c.i1; i++) arr[i - c.i0] = c.prof.eval(tth[i] - c.peakPos);
+                let omegaSum = 0;
+                for (let i = c.i0; i <= c.i1; i++) {
+                    const omega = c.prof.eval(tth[i] - c.peakPos);
+                    arr[i - c.i0] = omega;
+                    omegaSum += omega;
+                }
                 c.omega = arr;
-            }
+                c.omegaSum = omegaSum;
+                return omegaSum > 0 && Number.isFinite(omegaSum);
+            });
+            if (contexts.length === 0) { hklList.forEach(p => p.intensity = 0); return; }
 
             // Reflections with no evaluation window (outside the data range, or zero width) take
             // no part in the partition, so they must stay at zero rather than being lifted to the
@@ -1660,9 +1690,8 @@ const parsePhilipsUdfFile = (text) => {
                 Math.min(LEBAIL_MAX_CYCLES, Math.round(LEBAIL_CYCLE_BUDGET / Math.max(1, contexts.length))));
 
             // Le Bail's standard start: all intensities equal. Any previously extracted, strictly
-            // positive intensities are reused as a better starting point. (The update is
-            // invariant under an overall rescaling of I, so it is harmless that those values are
-            // on the integrated scale while the iteration itself works in channel sums.)
+            // positive intensities are reused as a better starting point. The update and
+            // returned intensities both use the integrated scale.
             const I = new Float64Array(M);
             let anyPositive = false;
             for (let k = 0; k < M; k++) {
@@ -1694,7 +1723,7 @@ const parsePhilipsUdfFile = (text) => {
                         const S = sumCalc[i];
                         if (S > 1e-12) acc += yobs[i] * (Ik * c.omega[i - c.i0]) / S;
                     }
-                    Inew[c.peakIdx] = acc;
+                    Inew[c.peakIdx] = acc / c.omegaSum;
                 }
 
                 // Background-subtracted data can dip negative and a negative structure factor is
@@ -1718,7 +1747,7 @@ const parsePhilipsUdfFile = (text) => {
 
             lastLeBailCycles = cyclesUsed;
             lastLeBailSettled = settled;
-            for (let k = 0; k < M; k++) hklList[k].intensity = I[k] * step;
+            for (let k = 0; k < M; k++) hklList[k].intensity = I[k];
         }
 
         function calculateStatistics(totalWorkingData, netCalcPattern, backgroundSlice, fitFlags) {
@@ -1893,8 +1922,11 @@ const parsePhilipsUdfFile = (text) => {
             const convergenceNotes = [];
             if (fitResults.algorithm === 'lm') {
                 if (fitResults.converged === false) {
-                    convergenceNotes.push(`The refinement used all ${maxIterations} iterations without meeting the convergence `
-                        + `test, so these parameters are not a converged minimum. Raise the iteration limit and run again.`);
+                    convergenceNotes.push(fitResults.stalled
+                        ? 'The refinement could not find a downhill step before satisfying the convergence test. '
+                            + 'These parameters are not a confirmed minimum; check the starting cell or run Simulated Annealing first.'
+                        : `The refinement used all ${maxIterations} iterations without meeting the convergence `
+                            + 'test, so these parameters are not a converged minimum. Raise the iteration limit and run again.');
                 }
                 if (finalStats.rwp > 25) {
                     convergenceNotes.push(`Rwp = ${finalStats.rwp.toFixed(1)}% is far too high for a Le Bail fit. Levenberg-Marquardt `
@@ -2262,7 +2294,7 @@ const parsePhilipsUdfFile = (text) => {
 
             const MAX_LAMBDA_ESCALATIONS = 12;
             let prevBaseCost = Infinity, JtJ = null;
-            let lastStepAccepted = true, converged = false, iterationsUsed = 0, varianceBlocked = 0;
+            let lastStepAccepted = true, converged = false, stalled = false, iterationsUsed = 0, varianceBlocked = 0;
 
             for (let iter = 0; iter < maxIter; iter++) {
                 iterationsUsed = iter + 1;
@@ -2305,9 +2337,9 @@ const parsePhilipsUdfFile = (text) => {
 
                 // Inner Marquardt loop: keep raising lambda until a downhill, physically
                 // admissible step appears. The Jacobian is reused, so each retry costs one
-                // residual evaluation rather than a full re-linearisation. If no lambda at all
-                // produces a downhill step we are at a genuine minimum -- that, and not an
-                // unchanged cost, is the correct convergence criterion.
+                // residual evaluation rather than a full re-linearisation. Failure to find a
+                // step alone does not establish convergence: finite-difference error or a dead
+                // Jacobian can also prevent descent.
                 lastStepAccepted = false;
                 for (let attempt = 0; attempt < MAX_LAMBDA_ESCALATIONS; attempt++) {
                     const A_lm = JSON.parse(JSON.stringify(JtJ));
@@ -2336,7 +2368,19 @@ const parsePhilipsUdfFile = (text) => {
                     lambda = Math.min(lambda * 10, 1e9);
                 }
 
-                if (!lastStepAccepted) { converged = true; break; }
+                if (!lastStepAccepted) {
+                    let gradientRatio = 0, hasSensitivity = false;
+                    for (let i = 0; i < Jtr.length; i++) {
+                        if (JtJ[i][i] > 0) {
+                            hasSensitivity = true;
+                            gradientRatio = Math.max(gradientRatio,
+                                Math.abs(Jtr[i]) / (Math.sqrt(JtJ[i][i]) * Math.max(1, Math.sqrt(cost))));
+                        }
+                    }
+                    converged = hasSensitivity && Number.isFinite(gradientRatio) && gradientRatio < 1e-7;
+                    stalled = !converged;
+                    break;
+                }
 
                 if (progressCallback) await progressCallback((iter + 1) / maxIter, null);
             }
@@ -2360,7 +2404,7 @@ const parsePhilipsUdfFile = (text) => {
             JtJ = multiply(transpose(Jf), Jf);
 
             return { params, JtJ, ss_res, algorithm: 'lm', paramMapping, fitFlags, constraints,
-                     converged, iterationsUsed, varianceRepair, varianceBlocked };
+                     converged, stalled, iterationsUsed, varianceRepair, varianceBlocked };
         }
 
         // Build HKL marker bar data, skipping any peaks whose corrected 2θ falls outside the
@@ -2858,7 +2902,7 @@ const parsePhilipsUdfFile = (text) => {
                         if (covResult && covResult.dropped.length) {
                             esdWarning = "No ESD could be determined for: "
                                 + covResult.dropped.map(d => `${d.name} (${d.reason})`).join(', ')
-                                + ". Other parameters are unaffected.";
+                                + ". ESDs are shown only for individually identifiable parameters.";
                         } else if (!cov_matrix) {
                             esdWarning = "ESD calculation failed: the normal matrix could not be inverted.";
                         }
@@ -2911,7 +2955,7 @@ const parsePhilipsUdfFile = (text) => {
                 if (esdWarning) {
                     yPos += 5;
                     doc.setTextColor(255, 0, 0);
-                    doc.text(esdWarning, margin, yPos);
+                    doc.splitTextToSize(esdWarning, pdfWidth - 2 * margin).forEach(line => addLine(line));
                     doc.setTextColor(0, 0, 0);
                 }
 
